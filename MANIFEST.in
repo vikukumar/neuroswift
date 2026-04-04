@@ -1,0 +1,5 @@
+include README.md
+include AUTHORS.md
+include CHANGELOG.md
+include VERSION
+recursive-include neuroswift *.py

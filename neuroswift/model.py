@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+import torch.nn.functional as F
+from safetensors.torch import load_model as load_safetensors_model
+from safetensors.torch import save_model as save_safetensors_model
+from torch import nn
+
+from .layers import LinearSSM, RMSNorm, SparseMoE
+from .plasticity import HebbianUpdater
+
+Tensor = torch.Tensor
+
+
+@dataclass
+class NeuroSwiftConfig:
+    vocab_size: int
+    d_model: int = 128
+    n_layers: int = 4
+    d_state: int = 16
+    expansion: int = 2
+    conv_kernel: int = 4
+    num_experts: int = 8
+    top_k: int = 2
+    expert_hidden: int = 256
+    plastic_dim: int = 48
+    dropout: float = 0.1
+    aux_loss_scale: float = 1e-2
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["model_type"] = "neuroswift"
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "NeuroSwiftConfig":
+        normalized = dict(payload)
+        normalized.pop("model_type", None)
+        return cls(**normalized)
+
+
+class NeuroSwiftBlock(nn.Module):
+    def __init__(self, config: NeuroSwiftConfig) -> None:
+        super().__init__()
+        self.ssm = LinearSSM(
+            d_model=config.d_model,
+            d_state=config.d_state,
+            expansion=config.expansion,
+            conv_kernel=config.conv_kernel,
+            dropout=config.dropout,
+        )
+        self.moe = SparseMoE(
+            d_model=config.d_model,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+            expert_hidden=config.expert_hidden,
+            dropout=config.dropout,
+        )
+        self.plasticity = HebbianUpdater(
+            d_model=config.d_model,
+            plastic_dim=config.plastic_dim,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        ssm_state: Optional[Tensor] = None,
+        plastic_state: Optional[Tensor] = None,
+        update_plasticity: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        x, next_ssm_state = self.ssm(x, state=ssm_state)
+        x, aux_loss = self.moe(x)
+        x, next_plastic_state = self.plasticity(
+            x,
+            fast_weights=plastic_state,
+            update=update_plasticity,
+        )
+        return x, next_ssm_state, next_plastic_state, aux_loss
+
+
+class NeuroSwiftLM(nn.Module):
+    def __init__(self, config: NeuroSwiftConfig) -> None:
+        super().__init__()
+        self.config = config
+
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([NeuroSwiftBlock(config) for _ in range(config.n_layers)])
+        self.final_norm = RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        self.apply(self._init_weights)
+        self.lm_head.weight = self.token_embedding.weight
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Conv1d):
+            nn.init.kaiming_uniform_(module.weight, a=5 ** 0.5)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        targets: Optional[Tensor] = None,
+        ssm_states: Optional[list[Optional[Tensor]]] = None,
+        plastic_states: Optional[list[Optional[Tensor]]] = None,
+        update_plasticity: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        if update_plasticity is None:
+            update_plasticity = not self.training
+
+        x = self.token_embedding(input_ids)
+        x = self.dropout(x)
+
+        if ssm_states is None:
+            ssm_states = [None] * len(self.blocks)
+        if plastic_states is None:
+            plastic_states = [None] * len(self.blocks)
+
+        next_ssm_states: list[Tensor] = []
+        next_plastic_states: list[Tensor] = []
+        aux_losses = []
+
+        for idx, block in enumerate(self.blocks):
+            x, next_ssm, next_plastic, aux_loss = block(
+                x,
+                ssm_state=ssm_states[idx],
+                plastic_state=plastic_states[idx],
+                update_plasticity=update_plasticity,
+            )
+            next_ssm_states.append(next_ssm.detach())
+            next_plastic_states.append(next_plastic.detach())
+            aux_losses.append(aux_loss)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        aux_loss = torch.stack(aux_losses).mean() if aux_losses else logits.new_tensor(0.0)
+
+        out: dict[str, Any] = {
+            "logits": logits,
+            "aux_loss": aux_loss,
+            "ssm_states": next_ssm_states,
+            "plastic_states": next_plastic_states,
+        }
+
+        if targets is not None:
+            ce_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+            )
+            out["loss"] = ce_loss + self.config.aux_loss_scale * aux_loss
+
+        return out
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int = 40,
+        temperature: float = 1.0,
+    ) -> Tensor:
+        self.eval()
+        temperature = max(temperature, 1e-5)
+
+        outputs = self(
+            input_ids,
+            ssm_states=None,
+            plastic_states=None,
+            update_plasticity=True,
+        )
+        ssm_states = outputs["ssm_states"]
+        plastic_states = outputs["plastic_states"]
+        generated = input_ids
+
+        for _ in range(max_new_tokens):
+            logits = outputs["logits"][:, -1] / temperature
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            generated = torch.cat([generated, next_token], dim=1)
+            outputs = self(
+                next_token,
+                ssm_states=ssm_states,
+                plastic_states=plastic_states,
+                update_plasticity=True,
+            )
+            ssm_states = outputs["ssm_states"]
+            plastic_states = outputs["plastic_states"]
+
+        return generated
+
+    def save_pretrained(self, save_directory: str | Path) -> None:
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        (save_dir / "config.json").write_text(
+            json.dumps(self.config.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+        save_safetensors_model(
+            self,
+            str(save_dir / "model.safetensors"),
+            metadata={
+                "format": "pt",
+                "model_type": "neuroswift",
+                "creator": "Vikash Kumar",
+            },
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        save_directory: str | Path,
+        device: str | torch.device = "cpu",
+    ) -> "NeuroSwiftLM":
+        save_dir = Path(save_directory)
+        config = NeuroSwiftConfig.from_dict(
+            json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
+        )
+        model = cls(config)
+        load_safetensors_model(model, save_dir / "model.safetensors", device=str(device))
+        model.to(device)
+        model.eval()
+        return model
+
+
+__all__ = ["NeuroSwiftConfig", "NeuroSwiftLM"]

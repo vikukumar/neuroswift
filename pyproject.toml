@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuroswift"
+dynamic = ["version"]
+description = "CPU-optimized language modeling with linear state-space layers, sparse experts, and online plasticity."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Vikash Kumar" }
+]
+keywords = ["llm", "ssm", "moe", "hebbian-learning", "cpu-inference", "pytorch"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.4.0",
+  "numpy>=1.26.0",
+  "einops>=0.7.0",
+  "transformers>=4.44.0",
+  "safetensors>=0.4.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/vikukumar/neuroswift"
+Repository = "https://github.com/vikukumar/neuroswift"
+Issues = "https://github.com/vikukumar/neuroswift/issues"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.0",
+  "twine>=5.1.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["neuroswift*"]
+
+[tool.setuptools.package-data]
+neuroswift = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}

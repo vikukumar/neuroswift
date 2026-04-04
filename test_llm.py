@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from neuroswift.model import NeuroSwiftConfig, NeuroSwiftLM
+from neuroswift.model import NeuroSwiftLM
 from neuroswift.tokenizer import CharTokenizer
 
 
@@ -24,8 +24,8 @@ def parse_args() -> ArgumentParser:
         default=None,
         help="Prompt to generate from. Defaults to the training script prompt.",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=80, help="Number of tokens to generate.")
-    parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature.")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Number of tokens to generate.")
+    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     return parser
 
 

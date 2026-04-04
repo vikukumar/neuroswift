@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from neuroswift.model import NeuroSwiftLM
-from neuroswift.tokenizer import CharTokenizer
+from neuroswift.tokenizer import load_tokenizer
 
 
 def parse_args() -> ArgumentParser:
@@ -44,7 +44,7 @@ def main() -> None:
         generation_config = {"prompt": "neuroswift ", "max_new_tokens": 80, "temperature": 0.9}
 
     model = NeuroSwiftLM.from_pretrained(args.model_dir, device=device)
-    tokenizer = CharTokenizer.from_pretrained(args.model_dir)
+    tokenizer = load_tokenizer(args.model_dir)
     prompt = args.prompt if args.prompt is not None else generation_config.get("prompt", "neuroswift ")
     prompt_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
 
@@ -65,6 +65,7 @@ def main() -> None:
             prompt_ids,
             max_new_tokens=args.max_new_tokens or generation_config.get("max_new_tokens", 80),
             temperature=args.temperature if args.temperature is not None else generation_config.get("temperature", 0.9),
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
         )
 
     print(f"Loaded model directory: {args.model_dir}")

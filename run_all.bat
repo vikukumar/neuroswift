@@ -10,7 +10,7 @@ if errorlevel 1 goto :error
 python train_small_llm.py --data-path examples\data\neuroswift_corpus.txt --output-dir artifacts\neuroswift-tiny
 if errorlevel 1 goto :error
 
-python test_llm.py --model-dir artifacts\neuroswift-tiny --prompt "neuroswift "
+python test_llm.py --model-dir artifacts\neuroswift-tiny --prompt "neuroswift uses instruction data"
 if errorlevel 1 goto :error
 
 endlocal

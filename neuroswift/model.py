@@ -169,6 +169,7 @@ class NeuroSwiftLM(nn.Module):
         input_ids: Tensor,
         max_new_tokens: int = 40,
         temperature: float = 1.0,
+        eos_token_id: Optional[int] = None,
     ) -> Tensor:
         self.eval()
         temperature = max(temperature, 1e-5)
@@ -187,6 +188,9 @@ class NeuroSwiftLM(nn.Module):
             logits = outputs["logits"][:, -1] / temperature
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+
+            if eos_token_id is not None and torch.all(next_token == eos_token_id):
+                break
 
             generated = torch.cat([generated, next_token], dim=1)
             outputs = self(

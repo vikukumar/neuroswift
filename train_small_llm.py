@@ -49,7 +49,7 @@ def load_corpus_lines(data_path: Path, max_lines: int = 0) -> list[str]:
 
 def parse_args() -> ArgumentParser:
     parser = ArgumentParser(description="Train a NeuroSwift language model on an example corpus.")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--seq-len", type=int, default=96, help="Training sequence length.")
     parser.add_argument("--stride", type=int, default=48, help="Sliding window stride.")
@@ -71,6 +71,12 @@ def parse_args() -> ArgumentParser:
         type=int,
         default=0,
         help="Optional cap on the number of corpus lines to load. Use 0 for all lines.",
+    )
+    parser.add_argument(
+        "--max-sequences",
+        type=int,
+        default=2048,
+        help="Maximum number of training sequences to keep after windowing. Use 0 for all sequences.",
     )
     parser.add_argument(
         "--prompt",
@@ -99,6 +105,11 @@ def main() -> None:
     token_ids = torch.tensor(tokenizer.encode(all_text), dtype=torch.long)
 
     inputs, targets = build_examples(token_ids, seq_len=args.seq_len, stride=args.stride)
+    candidate_sequences = inputs.size(0)
+    if args.max_sequences > 0 and candidate_sequences > args.max_sequences:
+        keep = torch.randperm(candidate_sequences)[: args.max_sequences]
+        inputs = inputs.index_select(0, keep)
+        targets = targets.index_select(0, keep)
     dataset = TensorDataset(inputs, targets)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -118,7 +129,8 @@ def main() -> None:
     )
     print("NeuroSwift config:", asdict(config))
     print(f"Loaded {len(corpus)} training lines from {args.data_path}")
-    print(f"Constructed {len(dataset)} training sequences")
+    print(f"Constructed {candidate_sequences} candidate sequences")
+    print(f"Using {len(dataset)} training sequences")
 
     model = NeuroSwiftLM(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -191,6 +203,7 @@ def main() -> None:
         "creator": "Vikash Kumar",
         "data_path": str(args.data_path),
         "num_lines": len(corpus),
+        "candidate_sequences": candidate_sequences,
         "num_sequences": len(dataset),
         "final_loss": last_loss,
         "plasticity_mean_logit_shift": plastic_shift,

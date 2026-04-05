@@ -1,0 +1,21 @@
+id,question,answer
+1,A chasing B who is chased,B
+2,A near B what is A,A
+3,A behind B what is A,A
+4,A in front of B who is in front,A
+5,A follows B who is followed,B
+6,"A is above B what is above,",A
+7,A is below B what is below,A
+8,A is left of B what is on left,A
+9,A is right of B what is on right,A
+10,A pushes B who is pushed,B
+11,A pulls B who is pulled,B
+12,A is bigger than B which is bigger,A
+13,A is smaller than B which is smaller,A
+14,A is inside B what is inside,A
+15,A is outside B what is outside,A
+16,A gives something to B who receives,B
+17,A takes something from B who gives,B
+18,A is closer to C than B who is closest,A
+19,A and B are running who is mentioned first,A
+20,A stops B who stops,B

@@ -11,8 +11,9 @@ from safetensors.torch import load_model as load_safetensors_model
 from safetensors.torch import save_model as save_safetensors_model
 from torch import nn
 
+from .artifacts_io import ArtifactSaver, OmniArtifact
 from .ingest import DatasetFolderReader, MultimodalSample
-from .layers import RMSNorm
+from .layers import CrossModalAttention, RMSNorm, auto_device
 from .model import NeuroSwiftBlock, NeuroSwiftConfig, NeuroSwiftLM
 from .prompting import PromptEngineer, infer_prompt_intent
 from .rag import STOPWORDS, NeuroSwiftRAG
@@ -35,13 +36,14 @@ class NeuroSwiftOmniConfig:
     plastic_dim: int = 64
     dropout: float = 0.05
     aux_loss_scale: float = 1e-2
-    image_size: int = 64
+    image_size: int = 128          # upgraded default: 128×128
     image_patch_size: int = 8
     audio_chunk_size: int = 256
     max_audio_chunks: int = 64
     max_video_frames: int = 8
-    video_frame_size: int = 32
-    output_audio_samples: int = 4096
+    video_frame_size: int = 64     # upgraded default: 64×64 frames
+    output_audio_samples: int = 8192  # longer audio output
+    cross_modal_heads: int = 4     # heads for CrossModalAttention fusion
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -137,13 +139,78 @@ class VideoFrameEncoder(nn.Module):
         return frame_tokens + self.frame_position(positions).unsqueeze(0)
 
 
+# ---------------------------------------------------------------------------
+# CNN upsampling decoders for higher spatial fidelity
+# ---------------------------------------------------------------------------
+
+
+class ImageCNNDecoder(nn.Module):
+    """Decode a pooled [B, D] feature into [B, 3, H, W] image via Conv transpose."""
+
+    def __init__(self, d_model: int, out_size: int) -> None:
+        super().__init__()
+        # Project to small spatial feature map, then upsample
+        self.start_size = max(4, out_size // 32)   # e.g. 4 for out_size=128
+        self.proj = nn.Linear(d_model, 128 * self.start_size * self.start_size)
+        # 4→8→16→32→out_size with 4 upsampling stages (each ×2)
+        stages: list[nn.Module] = []
+        in_ch = 128
+        for out_ch in [64, 32, 16, 8]:
+            stages += [
+                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1),
+                nn.SiLU(),
+            ]
+            in_ch = out_ch
+        self.upsample = nn.Sequential(*stages)
+        # Final 1×1 conv to 3 channel + forced spatial crop/pad to out_size
+        self.to_rgb = nn.Conv2d(in_ch, 3, kernel_size=1)
+        self.out_size = out_size
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Args: pooled [B, D].  Returns [B, 3, H, W]."""
+        B = pooled.size(0)
+        x = F.silu(self.proj(pooled))
+        x = x.view(B, 128, self.start_size, self.start_size)
+        x = self.upsample(x)
+        x = self.to_rgb(x)
+        # Crop or interpolate to exact target size
+        if x.shape[-1] != self.out_size or x.shape[-2] != self.out_size:
+            x = F.interpolate(x, size=(self.out_size, self.out_size), mode="bilinear", align_corners=False)
+        return torch.sigmoid(x)
+
+
+class VideoCNNDecoder(nn.Module):
+    """Decode a pooled [B, D] feature into [B, F, 3, H, W] video frames."""
+
+    def __init__(self, d_model: int, n_frames: int, frame_size: int) -> None:
+        super().__init__()
+        self.n_frames = n_frames
+        self.frame_decoder = ImageCNNDecoder(d_model, frame_size)
+        # Temporal MLP to generate per-frame conditioning
+        self.frame_proj = nn.Linear(d_model, d_model * n_frames)
+        self.frame_size = frame_size
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Args: pooled [B, D].  Returns [B, F, 3, H, W]."""
+        B, D = pooled.shape
+        # Generate per-frame conditioning vectors
+        frame_conds = self.frame_proj(pooled).view(B * self.n_frames, D)
+        # Decode each frame
+        frames = self.frame_decoder(frame_conds)  # [B*F, 3, H, W]
+        return frames.view(B, self.n_frames, 3, self.frame_size, self.frame_size)
+
+
 class NeuroSwiftOmni(nn.Module):
     """
-    Shared linear-time backbone for text plus lightweight multimodal heads.
+    Shared linear-time backbone for text plus multimodal heads.
 
-    This is a CPU-first research scaffold: text reasoning uses the full SSM+MoE
-    path, and image/audio/video heads decode shared hidden summaries into low-
-    footprint latent outputs suitable for later refinement or downstream codecs.
+    Architecture highlights
+    -----------------------
+    * SSM + SparseMoE + Hebbian plasticity blocks (CPU-first, O(T) complexity)
+    * Parallel associative scan on GPU for long sequences
+    * CrossModalAttention fusion layer between pooled modalities
+    * CNN upsampling image/video decoders (128×128 / 64×64 default)
+    * AMP (float16) on CUDA, float32 on CPU – seamless device switching
     """
 
     def __init__(self, config: NeuroSwiftOmniConfig) -> None:
@@ -170,15 +237,25 @@ class NeuroSwiftOmni(nn.Module):
         self.blocks = nn.ModuleList([NeuroSwiftBlock(core_config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model)
 
-        self.text_head = nn.Linear(config.d_model, config.text_vocab_size, bias=False)
-        self.image_decoder = nn.Linear(
-            config.d_model,
-            3 * config.image_size * config.image_size,
+        # Cross-modal attention for inter-modality fusion
+        self.cross_modal_attn = CrossModalAttention(
+            d_model=config.d_model,
+            n_heads=config.cross_modal_heads,
+            dropout=config.dropout,
         )
-        self.audio_decoder = nn.Linear(config.d_model, config.output_audio_samples)
-        self.video_decoder = nn.Linear(
-            config.d_model,
-            config.max_video_frames * 3 * config.video_frame_size * config.video_frame_size,
+
+        self.text_head = nn.Linear(config.d_model, config.text_vocab_size, bias=False)
+
+        # Upgraded CNN decoders
+        self.image_decoder = ImageCNNDecoder(config.d_model, config.image_size)
+        self.video_decoder = VideoCNNDecoder(
+            config.d_model, config.max_video_frames, config.video_frame_size
+        )
+        # Audio decoder: linear is fine for 1-D waveform
+        self.audio_decoder = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model * 2),
+            nn.SiLU(),
+            nn.Linear(config.d_model * 2, config.output_audio_samples),
         )
 
         self.apply(self._init_weights)
@@ -260,19 +337,29 @@ class NeuroSwiftOmni(nn.Module):
         plastic_states: list[Tensor] = []
         aux_losses: list[Tensor] = []
 
-        for block in self.blocks:
-            x, next_ssm_state, next_plastic_state, aux_loss = block(
-                x,
-                ssm_state=None,
-                plastic_state=None,
-                update_plasticity=update_plasticity,
-            )
-            x = x * mask
-            ssm_states.append(next_ssm_state.detach())
-            plastic_states.append(next_plastic_state.detach())
-            aux_losses.append(aux_loss)
+        device = embeddings.device
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if device.type == "cuda" and torch.cuda.is_available()
+            else torch.autocast(device_type="cpu", enabled=False)
+        )
 
-        hidden_states = self.final_norm(x) * mask
+        with amp_ctx:
+            for block in self.blocks:
+                x, next_ssm_state, next_plastic_state, aux_loss = block(
+                    x,
+                    ssm_state=None,
+                    plastic_state=None,
+                    update_plasticity=update_plasticity,
+                )
+                x = x * mask
+                ssm_states.append(next_ssm_state.detach())
+                plastic_states.append(next_plastic_state.detach())
+                aux_losses.append(aux_loss)
+
+            hidden_states = self.final_norm(x) * mask
+
+        hidden_states = hidden_states.float()
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else hidden_states.new_tensor(0.0)
         pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
@@ -331,29 +418,20 @@ class NeuroSwiftOmni(nn.Module):
         )
         outputs["spans"] = spans
 
+        hidden = outputs["hidden_states"]
+
+        # Cross-modal attention: fuse all modality tokens through shared attention
+        # This allows e.g. image tokens to attend to text context and vice-versa
+        fused = self.cross_modal_attn(hidden, hidden)
+
         if "text" in spans:
-            text_hidden = outputs["hidden_states"][:, spans["text"]]
+            text_hidden = fused[:, spans["text"]]
             outputs["text_logits"] = self.text_head(text_hidden)
 
         summary = outputs["pooled_state"]
-        outputs["image_tensor"] = torch.sigmoid(
-            self.image_decoder(summary).view(
-                summary.size(0),
-                3,
-                self.config.image_size,
-                self.config.image_size,
-            )
-        )
+        outputs["image_tensor"] = self.image_decoder(summary)
         outputs["audio_tensor"] = torch.tanh(self.audio_decoder(summary))
-        outputs["video_tensor"] = torch.sigmoid(
-            self.video_decoder(summary).view(
-                summary.size(0),
-                self.config.max_video_frames,
-                3,
-                self.config.video_frame_size,
-                self.config.video_frame_size,
-            )
-        )
+        outputs["video_tensor"] = self.video_decoder(summary)
         return outputs
 
     @torch.no_grad()
@@ -424,8 +502,10 @@ class NeuroSwiftOmni(nn.Module):
     def from_pretrained(
         cls,
         save_directory: str | Path,
-        device: str | torch.device = "cpu",
+        device: str | torch.device | None = None,
     ) -> "NeuroSwiftOmni":
+        if device is None:
+            device = auto_device()
         save_dir = Path(save_directory)
         config = NeuroSwiftOmniConfig.from_dict(
             json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
@@ -435,6 +515,57 @@ class NeuroSwiftOmni(nn.Module):
         model.to(device)
         model.eval()
         return model
+
+    # ------------------------------------------------------------------
+    # One-shot generation + artifact saving
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def generate_artifact(
+        self,
+        prompt_ids: Tensor,
+        prompt_text: str,
+        modality: str = "image",
+        out_dir: str | Path = "artifacts/generated",
+        sample_rate: int = 22050,
+        video_fps: int = 8,
+        assemble_mp4: bool = True,
+    ) -> OmniArtifact:
+        """Generate a multimodal output and save it as a real artifact file.
+
+        Args:
+            prompt_ids: Encoded prompt tensor ``[1, T]``.
+            prompt_text: Raw prompt string (stored in OmniArtifact metadata).
+            modality: One of ``"image"``, ``"audio"``, ``"video"``.
+            out_dir: Root directory for saved artifacts.
+            sample_rate: Hz for WAV output.
+            video_fps: FPS for MP4 assembly.
+            assemble_mp4: Try to write MP4 via imageio.
+
+        Returns:
+            :class:`OmniArtifact` with paths to all saved files.
+        """
+        self.eval()
+        outputs = self.forward(text_input_ids=prompt_ids, update_plasticity=False)
+
+        saver = ArtifactSaver(
+            out_dir=Path(out_dir),
+            sample_rate=sample_rate,
+            video_fps=video_fps,
+            assemble_mp4=assemble_mp4,
+        )
+
+        img = outputs.get("image_tensor") if modality in ("image", "all") else None
+        aud = outputs.get("audio_tensor") if modality in ("audio", "all") else None
+        vid = outputs.get("video_tensor") if modality in ("video", "all") else None
+
+        return saver.save(
+            prompt=prompt_text,
+            modality=modality,
+            image_tensor=img,
+            audio_tensor=aud,
+            video_tensor=vid,
+        )
 
 
 class NeuroSwiftAssistant:

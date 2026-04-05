@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -11,7 +12,7 @@ from safetensors.torch import load_model as load_safetensors_model
 from safetensors.torch import save_model as save_safetensors_model
 from torch import nn
 
-from .layers import LinearSSM, RMSNorm, SparseMoE
+from .layers import LinearSSM, RMSNorm, SparseMoE, auto_device
 from .plasticity import HebbianUpdater
 
 Tensor = torch.Tensor
@@ -84,9 +85,10 @@ class NeuroSwiftBlock(nn.Module):
 
 
 class NeuroSwiftLM(nn.Module):
-    def __init__(self, config: NeuroSwiftConfig) -> None:
+    def __init__(self, config: NeuroSwiftConfig, use_checkpoint: bool = False) -> None:
         super().__init__()
         self.config = config
+        self.use_checkpoint = use_checkpoint
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
@@ -120,6 +122,11 @@ class NeuroSwiftLM(nn.Module):
         if update_plasticity is None:
             update_plasticity = not self.training
 
+        device = input_ids.device
+        # Auto-set CPU threads for best single-process throughput
+        if device.type == "cpu":
+            torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+
         x = self.token_embedding(input_ids)
         x = self.dropout(x)
 
@@ -132,19 +139,39 @@ class NeuroSwiftLM(nn.Module):
         next_plastic_states: list[Tensor] = []
         aux_losses = []
 
-        for idx, block in enumerate(self.blocks):
-            x, next_ssm, next_plastic, aux_loss = block(
-                x,
-                ssm_state=ssm_states[idx],
-                plastic_state=plastic_states[idx],
-                update_plasticity=update_plasticity,
-            )
-            next_ssm_states.append(next_ssm.detach())
-            next_plastic_states.append(next_plastic.detach())
-            aux_losses.append(aux_loss)
+        # AMP context: use autocast on CUDA, no-op on CPU
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if device.type == "cuda" and torch.cuda.is_available()
+            else torch.autocast(device_type="cpu", enabled=False)
+        )
 
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        with amp_ctx:
+            for idx, block in enumerate(self.blocks):
+                if self.use_checkpoint and self.training:
+                    from torch.utils.checkpoint import checkpoint as ckpt
+                    def _block_fn(x_in, ssm_s, plastic_s):
+                        return block(x_in, ssm_state=ssm_s, plastic_state=plastic_s, update_plasticity=update_plasticity)
+                    x, next_ssm, next_plastic, aux_loss = ckpt(
+                        _block_fn, x, ssm_states[idx], plastic_states[idx],
+                        use_reentrant=False,
+                    )
+                else:
+                    x, next_ssm, next_plastic, aux_loss = block(
+                        x,
+                        ssm_state=ssm_states[idx],
+                        plastic_state=plastic_states[idx],
+                        update_plasticity=update_plasticity,
+                    )
+                next_ssm_states.append(next_ssm.detach())
+                next_plastic_states.append(next_plastic.detach())
+                aux_losses.append(aux_loss)
+
+            x = self.final_norm(x)
+            logits = self.lm_head(x)
+
+        # Cast back to float32 for loss computation
+        logits = logits.float()
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else logits.new_tensor(0.0)
 
         out: dict[str, Any] = {
@@ -281,13 +308,16 @@ class NeuroSwiftLM(nn.Module):
     def from_pretrained(
         cls,
         save_directory: str | Path,
-        device: str | torch.device = "cpu",
+        device: str | torch.device | None = None,
+        use_checkpoint: bool = False,
     ) -> "NeuroSwiftLM":
+        if device is None:
+            device = auto_device()
         save_dir = Path(save_directory)
         config = NeuroSwiftConfig.from_dict(
             json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
         )
-        model = cls(config)
+        model = cls(config, use_checkpoint=use_checkpoint)
         load_safetensors_model(model, save_dir / "model.safetensors", device=str(device))
         model.to(device)
         model.eval()

@@ -277,6 +277,21 @@ class AutoTrainer:
         total_loss = 0.0
         n_batches = 0
 
+        # Setup rich UI if enabled
+        from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
+        if self.use_ui:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeRemainingColumn(),
+            )
+            step_task = progress.add_task(f"Training Cycle {self.cycle}", total=len(loader) * self.epochs_per_cycle)
+            progress.start()
+        else:
+            progress = None
+
         for epoch in range(self.epochs_per_cycle):
             for batch_inputs, batch_targets in loader:
                 batch_inputs = batch_inputs.to(self.device)
@@ -293,12 +308,19 @@ class AutoTrainer:
                 total_loss += loss.item()
                 n_batches += 1
                 self.global_step += 1
+                self.total_tokens_trained += batch_inputs.numel()
+
+                if progress:
+                    progress.update(step_task, advance=1, description=f"Cycle {self.cycle} | Loss: {loss.item():.4f}")
 
                 if self.global_step % self.save_every == 0:
                     self.model.save_partial(self.output_dir, self.global_step, loss.item())
                     self._checkpoint()
 
             self._log(f"  Epoch {epoch + 1}/{self.epochs_per_cycle} — loss={total_loss / max(n_batches, 1):.4f}")
+
+        if progress:
+            progress.stop()
 
         # Plasticity warmup pass
         if self.plasticity_warmup and pairs:

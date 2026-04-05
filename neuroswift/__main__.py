@@ -426,6 +426,8 @@ def _cmd_auto_train(args: argparse.Namespace) -> None:
         save_every=args.save_every,
         plasticity_warmup=not args.no_plasticity,
         freeze_first_n_layers=args.freeze_layers,
+        evolution=args.evolution,
+        use_ui=not args.no_ui,
         verbose=True,
     )
 
@@ -455,6 +457,10 @@ def _add_auto_train_parser(sub: argparse._SubParsersAction) -> None:
                    help="Disable plasticity warm-up after each cycle.")
     p.add_argument("--once", action="store_true",
                    help="Run only one training cycle and exit.")
+    p.add_argument("--evolution", action="store_true",
+                   help="Enable progressive model growth (Weight Expansion).")
+    p.add_argument("--no-ui", action="store_true",
+                   help="Disable Rich live dashboard (use plain logging).")
     p.set_defaults(func=_cmd_auto_train)
 
 

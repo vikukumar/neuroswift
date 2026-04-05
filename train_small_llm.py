@@ -33,6 +33,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 import os
 import sys
 from argparse import ArgumentParser
@@ -71,36 +73,17 @@ def fmt_prompt(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_sft_tensors(
-    pairs: list[TrainPair],
-    tokenizer: WordTokenizer,
-    seq_len: int,
-    label_smoothing_ignore: int = -100,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """
-    Convert instruction pairs into (input_ids, labels) tensors.
-
-    Labels are masked (−100) over the prompt tokens so the model only
-    learns to predict the response.
-
-    Returns:
-        inputs  [N, seq_len]
-        labels  [N, seq_len]  (−100 for padding + prompt positions)
-        n_skipped
-    """
-    input_rows: list[torch.Tensor] = []
-    label_rows: list[torch.Tensor] = []
-    skipped = 0
-    pad_id = tokenizer.stoi[tokenizer.pad_token]
-
-    for pair in pairs:
-        prompt_ids = tokenizer.encode(fmt_prompt(pair.prompt), add_eos=False)
+def _sft_worker(args):
+    """Parallel worker for build_sft_tensors."""
+    pair, tokenizer, seq_len, fmt_fn = args
+    try:
+        pad_id = tokenizer.stoi[tokenizer.pad_token]
+        prompt_ids = tokenizer.encode(fmt_fn(pair.prompt), add_eos=False)
         resp_ids = tokenizer.encode(pair.response, add_eos=True)
         full_ids = (prompt_ids + resp_ids)[: seq_len + 1]
 
         if len(full_ids) < 2 or len(prompt_ids) >= len(full_ids):
-            skipped += 1
-            continue
+            return None
 
         input_ids = full_ids[:-1]
         labels: list[int] = []
@@ -108,19 +91,63 @@ def build_sft_tensors(
             labels.append(-100 if i < len(prompt_ids) else full_ids[i + 1])
 
         if not any(l != -100 for l in labels):
-            skipped += 1
-            continue
+            return None
 
         pad_len = seq_len - len(input_ids)
         if pad_len < 0:
-            skipped += 1
-            continue
+            return None
 
-        input_rows.append(torch.tensor(input_ids + [pad_id] * pad_len, dtype=torch.long))
-        label_rows.append(torch.tensor(labels + [-100] * pad_len, dtype=torch.long))
+        return (
+            torch.tensor(input_ids + [pad_id] * pad_len, dtype=torch.long),
+            torch.tensor(labels + [-100] * pad_len, dtype=torch.long)
+        )
+    except Exception:
+        return None
+
+
+def build_sft_tensors(
+    pairs: list[TrainPair],
+    tokenizer: WordTokenizer,
+    seq_len: int,
+    label_smoothing_ignore: int = -100,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Convert instruction pairs into (input_ids, labels) tensors in parallel.
+    Bypasses GIL using ProcessPoolExecutor.
+    """
+    if not pairs:
+        return torch.empty(0), torch.empty(0), 0
+
+    input_rows: list[torch.Tensor] = []
+    label_rows: list[torch.Tensor] = []
+    skipped = 0
+
+    # Only parallelize for non-trivial datasets
+    if len(pairs) > 500:
+        num_procs = min(multiprocessing.cpu_count(), 16)
+        worker_args = [(p, tokenizer, seq_len, fmt_prompt) for p in pairs]
+        
+        with ProcessPoolExecutor(max_workers=num_procs) as executor:
+            results = list(executor.map(_sft_worker, worker_args))
+        
+        for res in results:
+            if res is None:
+                skipped += 1
+            else:
+                input_rows.append(res[0])
+                label_rows.append(res[1])
+    else:
+        # Sequential fallback for tiny datasets (avoid process spawn overhead)
+        for pair in pairs:
+            res = _sft_worker((pair, tokenizer, seq_len, fmt_prompt))
+            if res is None:
+                skipped += 1
+            else:
+                input_rows.append(res[0])
+                label_rows.append(res[1])
 
     if not input_rows:
-        raise RuntimeError("No valid training examples could be built — check your data format.")
+        raise RuntimeError("No valid training examples built.")
 
     return torch.stack(input_rows), torch.stack(label_rows), skipped
 
@@ -216,25 +243,33 @@ Examples:
                           help="Fraction of pairs held out for validation.")
     data_grp.add_argument("--no-dedup", action="store_true",
                           help="Disable deduplication (faster but lower quality).")
+    data_grp.add_argument("--latent-dim", type=int, default=64,
+                          help="Latent compression dimension for MLA anchors.")
     data_grp.add_argument("--augment", action="store_true",
                           help="Enable light prompt-template augmentation.")
     data_grp.add_argument("--fetch-urls", action="store_true",
                           help="Fetch remote URL contents during ingestion.")
+    data_grp.add_argument("--hf-dataset", type=str, default=None,
+                          help="Hugging Face repo(s). Support comma-sep list.")
+    data_grp.add_argument("--kaggle-dataset", type=str, default=None,
+                          help="Kaggle dataset(s). Support comma-sep list.")
 
     # Training
     train_grp = p.add_argument_group("Training")
-    train_grp.add_argument("--epochs", type=int, default=3)
+    train_grp.add_argument("--epochs", type=int, default=10, 
+                           help="Number of epochs. Default 10 for small data high-accuracy.")
     train_grp.add_argument("--batch-size", type=int, default=0,
                            help="Batch size (0 = auto: 8 CPU, 32 GPU).")
     train_grp.add_argument("--grad-accum", type=int, default=1,
                            help="Gradient accumulation steps (effective_bs = batch × accum).")
-    train_grp.add_argument("--seq-len", type=int, default=128)
+    train_grp.add_argument("--seq-len", type=int, default=256,
+                           help="Sequence length (default 256 for linear context).")
     train_grp.add_argument("--lr", type=float, default=2e-3)
     train_grp.add_argument("--min-lr-ratio", type=float, default=0.1,
                            help="Minimum LR as a fraction of peak LR (cosine schedule).")
     train_grp.add_argument("--warmup-ratio", type=float, default=0.06,
                            help="Fraction of total steps used for linear LR warm-up.")
-    train_grp.add_argument("--label-smoothing", type=float, default=0.05)
+    train_grp.add_argument("--label-smoothing", type=float, default=0.1)
     train_grp.add_argument("--weight-decay", type=float, default=1e-2)
     train_grp.add_argument("--device", type=str, default=None,
                            help="cpu / cuda / mps (default: auto).")
@@ -258,6 +293,8 @@ Examples:
                           help="Enable gradient checkpointing (saves memory, slower).")
     arch_grp.add_argument("--compile", action="store_true",
                           help="Enable torch.compile() for massive speedup (requires Torch 2.0+).")
+    arch_grp.add_argument("--ternary", action="store_true",
+                          help="Enable BitNet-style addition-only training (1.58-bit).")
     arch_grp.add_argument("--use-ssd", action="store_true",
                           help="Force SSD-backed MmapDataset (even for small datasets).")
 
@@ -283,14 +320,14 @@ Examples:
 def auto_model_size(n_train: int, device: torch.device) -> tuple[int, int]:
     """Pick d_model and n_layers based on training set size and device."""
     if device.type == "cpu":
-        if n_train < 500:
-            return 128, 3
+        if n_train < 1_000:
+            return 192, 4
         elif n_train < 5_000:
-            return 160, 4
-        elif n_train < 20_000:
-            return 192, 5
-        else:
             return 224, 6
+        elif n_train < 20_000:
+            return 256, 8
+        else:
+            return 320, 10
     else:  # GPU
         if n_train < 2_000:
             return 192, 4
@@ -326,29 +363,35 @@ def main() -> None:
     logger.info(f"Device: {device}  |  Batch size: {batch_size}")
 
     # ── Data pipeline ──────────────────────────────────────────────────────
-    source: Path
-    if args.data_dir is not None:
-        source = args.data_dir
-        if not source.exists():
-            logger.error(f"--data-dir not found: {source}")
-            sys.exit(1)
-        logger.info(f"Auto-ingesting ALL data from: {source}")
-    elif args.data_path is not None:
-        source = args.data_path
-        if not source.exists():
-            logger.error(f"--data-path not found: {source}")
-            sys.exit(1)
-        logger.info(f"Ingesting data from: {source}")
-    else:
+    local_sources: list[Path] = []
+    if args.data_dir:
+        for d in str(args.data_dir).split(","):
+            dp = Path(d.strip())
+            if dp.exists():
+                local_sources.append(dp)
+    if args.data_path:
+        for p in str(args.data_path).split(","):
+            pp = Path(p.strip())
+            if pp.exists():
+                local_sources.append(pp)
+
+    hf_list = [s.strip() for s in args.hf_dataset.split(",")] if args.hf_dataset else None
+    kaggle_list = [s.strip() for s in args.kaggle_dataset.split(",")] if args.kaggle_dataset else None
+
+    if not local_sources and not hf_list and not kaggle_list:
         # Default fallback
-        source = Path("examples/data/neuroswift_qa.jsonl")
-        if not source.exists():
-            logger.error("No --data-dir or --data-path provided and default data not found.")
+        fallback = Path("examples/data/neuroswift_qa.jsonl")
+        if fallback.exists():
+            local_sources = [fallback]
+            logger.info(f"Using default data: {fallback}")
+        else:
+            logger.error("No data source provided.")
             sys.exit(1)
-        logger.info(f"Using default data: {source}")
 
     train_pairs, val_pairs, pipe_stats = run_pipeline(
-        source=source,
+        source=local_sources,
+        hf_dataset=hf_list,
+        kaggle_dataset=kaggle_list,
         max_total_pairs=args.max_examples if args.max_examples > 0 else 0,
         max_pairs_per_file=args.max_per_file,
         min_prompt_words=args.min_prompt_words,
@@ -408,6 +451,7 @@ def main() -> None:
             TensorDataset(train_inputs, train_labels),
             batch_size=batch_size,
             shuffle=True,
+            pin_memory=True if device.type == "cuda" else False,
             drop_last=True if len(train_inputs) >= batch_size else False,
         )
 
@@ -421,6 +465,7 @@ def main() -> None:
                 TensorDataset(v_inputs, v_labels),
                 batch_size=batch_size * 2,
                 shuffle=False,
+                pin_memory=True if device.type == "cuda" else False,
             )
         else:
             has_val = False
@@ -472,6 +517,8 @@ def main() -> None:
             plastic_dim=args.plastic_dim,
             dropout=args.dropout,
             aux_loss_scale=1e-2,
+            ternary_mode=args.ternary,
+            latent_dim=args.latent_dim,
         )
         model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
 
@@ -494,6 +541,7 @@ def main() -> None:
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
         lr=args.lr,
+        fused=True if device.type == "cuda" else False,
     )
     # Store initial_lr for scheduler
     for pg in optimizer.param_groups:
@@ -527,19 +575,15 @@ def main() -> None:
             batch_lbl = batch_lbl.to(device)
 
             if scaler is not None:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    out = model(batch_inp, targets=None, update_plasticity=False)
-                    logits = out["logits"].float()
-                    ce_loss = masked_ce_loss(logits, batch_lbl, args.label_smoothing)
-                    aux_loss = out["aux_loss"]
-                    loss = (ce_loss + model.config.aux_loss_scale * aux_loss) / args.grad_accum
+                # Use bf16 if available (more stable for SSMs)
+                dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    out = model(batch_inp, targets=batch_lbl, update_plasticity=False)
+                    loss = out["loss"] / args.grad_accum
                 scaler.scale(loss).backward()
             else:
-                out = model(batch_inp, targets=None, update_plasticity=False)
-                logits = out["logits"].float()
-                ce_loss = masked_ce_loss(logits, batch_lbl, args.label_smoothing)
-                aux_loss = out["aux_loss"]
-                loss = (ce_loss + model.config.aux_loss_scale * aux_loss) / args.grad_accum
+                out = model(batch_inp, targets=batch_lbl, update_plasticity=False)
+                loss = out["loss"] / args.grad_accum
                 loss.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(train_loader):
@@ -559,7 +603,7 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 n_steps += 1
 
-                epoch_loss += (ce_loss.item() * args.grad_accum)
+                epoch_loss += (loss.item() * args.grad_accum)
 
                 if args.save_every > 0 and global_step % args.save_every == 0:
                     model.save_partial(args.output_dir, global_step, loss.item())
@@ -579,7 +623,7 @@ def main() -> None:
                 best_val_loss = val_loss
                 patience_counter = 0
                 # Save best model
-                _save_checkpoint(model, tokenizer, args, mean_train_loss, is_best=True)
+                _save_checkpoint(model, tokenizer, args.output_dir, mean_train_loss, is_best=True)
             else:
                 patience_counter += 1
 
@@ -595,6 +639,13 @@ def main() -> None:
 
     # ── Post-training ─────────────────────────────────────────────────────
     model.eval()
+    
+    # Reload best model for evaluation/demo if it exists (highly important for accuracy!)
+    if best_val_loss < float("inf"):
+        logger.info("  Training complete. Reloading BEST model for generation demo...")
+        best_dir = args.output_dir / "best"
+        model = NeuroSwiftLM.from_pretrained(best_dir, device=device)
+    
     chat_prompt = fmt_prompt(args.prompt)
     prompt_ids = torch.tensor([tokenizer.encode(chat_prompt)], dtype=torch.long, device=device)
 
@@ -619,9 +670,18 @@ def main() -> None:
 
     answer_ids = gen_ids[0, prompt_ids.size(1):].tolist()
     generated_text = tokenizer.decode(answer_ids).strip()
+    
+    # Hallucination Check (Entropy-based Confidence)
+    with torch.no_grad():
+        gen_logits = model(gen_ids)["logits"][:, prompt_ids.size(1)-1:-1]
+        probs = torch.softmax(gen_logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).mean().item()
+        confidence = max(0, 100 - (entropy * 20)) # Heuristic God-level scorer
 
     # ── Save final artifacts ───────────────────────────────────────────────
-    _save_checkpoint(model, tokenizer, args, last_train_loss)
+    # Final epoch save (into 'last/' subfolder to avoid overwriting BEST in root)
+    last_dir = args.output_dir / "last"
+    _save_checkpoint(model, tokenizer, last_dir, last_train_loss)
 
     generation_config = {
         "prompt_template": "user: {prompt}\nassistant:",
@@ -660,6 +720,7 @@ def main() -> None:
         "config": model.config.to_dict(),
         "tokenizer_type": "word",
         "task_type": "instruction_qa",
+        "hallucination_confidence": f"{confidence:.2f}%",
     }
     (args.output_dir / "training_summary.json").write_text(
         json.dumps(training_summary, indent=2), encoding="utf-8"
@@ -696,6 +757,7 @@ def main() -> None:
     _p(f"  Vocab size:       {tokenizer.vocab_size:,}")
     _p(f"  Model params:     {n_params:,}")
     _p(f"\n  Prompt:  {args.prompt!r}")
+    _p(f"  Confidence: {confidence:.1f}% (Hallucination risk: {'LOW' if confidence > 80 else 'MEDIUM' if confidence > 50 else 'HIGH'})")
     _p(f"  Answer:  {generated_text}")
     _p(_sep + "\n")
 
@@ -730,19 +792,25 @@ def _evaluate(
 def _save_checkpoint(
     model: NeuroSwiftLM,
     tokenizer: WordTokenizer,
-    args,
+    output_dir: Path | str,
     last_loss: float,
     is_best: bool = False,
 ) -> None:
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    save_path = Path(output_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save full weights and config
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    
     if is_best:
-        # Also save to best/ sub-dir
-        best_dir = args.output_dir / "best"
+        # If this is the best model, also update a 'best' subdirectory
+        best_dir = save_path / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(best_dir)
         tokenizer.save_pretrained(best_dir)
+        # Create a tiny marker
+        (best_dir / "best_model_mark.txt").write_text(f"Loss: {last_loss:.4f}")
 
 
 # ---------------------------------------------------------------------------

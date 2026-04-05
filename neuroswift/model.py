@@ -12,7 +12,17 @@ from safetensors.torch import load_model as load_safetensors_model
 from safetensors.torch import save_model as save_safetensors_model
 from torch import nn
 
-from .layers import LinearSSM, RMSNorm, SparseMoE, auto_device
+from .layers import (
+    DynamicDepthGate,
+    LinearAttentionAnchor,
+    LinearSSM,
+    MLALinearAttention,
+    MultiTokenHead,
+    RMSNorm,
+    SelectiveSSD,
+    SparseMoE,
+    auto_device,
+)
 from .plasticity import HebbianUpdater
 
 Tensor = torch.Tensor
@@ -32,6 +42,9 @@ class NeuroSwiftConfig:
     plastic_dim: int = 48
     dropout: float = 0.1
     aux_loss_scale: float = 1e-2
+    attn_interval: int = 0  # Reverted default to protection legacy models
+    ternary_mode: bool = False  # Enable BitNet-style MatMul-free execution
+    latent_dim: int = 64  # Compression for MLA anchors
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -42,13 +55,21 @@ class NeuroSwiftConfig:
     def from_dict(cls, payload: dict[str, Any]) -> "NeuroSwiftConfig":
         normalized = dict(payload)
         normalized.pop("model_type", None)
+        # Legacy failsafe: If fields are missing (V1 model), use backward-compatible defaults
+        if "attn_interval" not in normalized:
+            normalized["attn_interval"] = 0
+        if "ternary_mode" not in normalized:
+            normalized["ternary_mode"] = False
+        if "latent_dim" not in normalized:
+            normalized["latent_dim"] = 64
         return cls(**normalized)
 
 
 class NeuroSwiftBlock(nn.Module):
     def __init__(self, config: NeuroSwiftConfig) -> None:
         super().__init__()
-        self.ssm = LinearSSM(
+        # Upgrade to SelectiveSSD (Mamba-2 style) for best O(N) sequence logic
+        self.ssm = SelectiveSSD(
             d_model=config.d_model,
             d_state=config.d_state,
             expansion=config.expansion,
@@ -66,21 +87,52 @@ class NeuroSwiftBlock(nn.Module):
             d_model=config.d_model,
             plastic_dim=config.plastic_dim,
         )
+        # Upgrade to MLALinearAttention (DeepSeek style) for reasoning IQ
+        self.attn = (
+            MLALinearAttention(
+                d_model=config.d_model, 
+                latent_dim=config.latent_dim,
+                dropout=config.dropout,
+            )
+            if config.attn_interval > 0
+            else None
+        )
+        self.thinking_gate = DynamicDepthGate(config.d_model)
 
     def forward(
         self,
         x: Tensor,
         ssm_state: Optional[Tensor] = None,
+        ssm_external_state: Optional[Tensor] = None,
         plastic_state: Optional[Tensor] = None,
         update_plasticity: bool = True,
+        use_attn: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        x, next_ssm_state = self.ssm(x, state=ssm_state)
-        x, aux_loss = self.moe(x)
-        x, next_plastic_state = self.plasticity(
+        # 0. Thinking Gate (DDS) - Predict intensity for this logic unit
+        thinking_intensity = self.thinking_gate(x) # [B, T, 1]
+
+        if use_attn and self.attn is not None:
+            x_attn, next_ssm_state = self.attn(x, state=ssm_state)
+            x = x + thinking_intensity * (x_attn - x)
+        else:
+            x_ssm, next_ssm_state = self.ssm(
+                x, 
+                state=ssm_state, 
+                external_state=ssm_external_state
+            )
+            # SSM always updates for state continuity, but intensity controls depth
+            x = x + thinking_intensity * (x_ssm - x)
+
+        x_moe, aux_loss = self.moe(x)
+        x = x + thinking_intensity * (x_moe - x)
+
+        x_plastic, next_plastic_state = self.plasticity(
             x,
             fast_weights=plastic_state,
             update=update_plasticity,
         )
+        x = x + thinking_intensity * (x_plastic - x)
+
         return x, next_ssm_state, next_plastic_state, aux_loss
 
 
@@ -95,6 +147,7 @@ class NeuroSwiftLM(nn.Module):
         self.blocks = nn.ModuleList([NeuroSwiftBlock(config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.mtp_head = MultiTokenHead(config.d_model, config.vocab_size, n_tokens=1)
 
         self.apply(self._init_weights)
         self.lm_head.weight = self.token_embedding.weight
@@ -116,6 +169,7 @@ class NeuroSwiftLM(nn.Module):
         input_ids: Tensor,
         targets: Optional[Tensor] = None,
         ssm_states: Optional[list[Optional[Tensor]]] = None,
+        ssm_external_states: Optional[list[Optional[Tensor]]] = None,
         plastic_states: Optional[list[Optional[Tensor]]] = None,
         update_plasticity: Optional[bool] = None,
     ) -> dict[str, Any]:
@@ -132,6 +186,8 @@ class NeuroSwiftLM(nn.Module):
 
         if ssm_states is None:
             ssm_states = [None] * len(self.blocks)
+        if ssm_external_states is None:
+            ssm_external_states = [None] * len(self.blocks)
         if plastic_states is None:
             plastic_states = [None] * len(self.blocks)
 
@@ -157,11 +213,14 @@ class NeuroSwiftLM(nn.Module):
                         use_reentrant=False,
                     )
                 else:
+                    use_attn = (self.config.attn_interval > 0 and (idx + 1) % self.config.attn_interval == 0)
                     x, next_ssm, next_plastic, aux_loss = block(
                         x,
                         ssm_state=ssm_states[idx],
+                        ssm_external_state=ssm_external_states[idx],
                         plastic_state=plastic_states[idx],
                         update_plasticity=update_plasticity,
+                        use_attn=use_attn,
                     )
                 next_ssm_states.append(next_ssm.detach())
                 next_plastic_states.append(next_plastic.detach())
@@ -176,17 +235,36 @@ class NeuroSwiftLM(nn.Module):
 
         out: dict[str, Any] = {
             "logits": logits,
+            "mtp_logits": None,
             "aux_loss": aux_loss,
             "ssm_states": next_ssm_states,
             "plastic_states": next_plastic_states,
         }
 
         if targets is not None:
+            # Standard next-token CE loss
             ce_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
             )
-            out["loss"] = ce_loss + self.config.aux_loss_scale * aux_loss
+            
+            # Multi-Token Prediction (MTP) Loss
+            # Predict token[i+2] from latent[i]
+            mtp_logits = self.mtp_head(x).float()
+            out["mtp_logits"] = mtp_logits
+            
+            mtp_loss = 0.0
+            if targets.size(1) > 1:
+                # Target for mtp_logits[i] is targets[i+1] (which is the token at i+2 in the sequence)
+                # Since targets is already shifted once (target[i] is token[i+1])
+                mtp_targets = targets[:, 1:]
+                mtp_loss = F.cross_entropy(
+                    mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
+                    mtp_targets.reshape(-1)
+                )
+            
+            # Combined Loss: Standard + 0.3*MTP + Aux
+            out["loss"] = ce_loss + 0.3 * mtp_loss + self.config.aux_loss_scale * aux_loss
 
         return out
 
@@ -248,12 +326,14 @@ class NeuroSwiftLM(nn.Module):
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         adapt_during_generation: bool = False,
+        ssm_external_states: Optional[list[Optional[Tensor]]] = None,
     ) -> Tensor:
         self.eval()
 
         outputs = self(
             input_ids,
             ssm_states=None,
+            ssm_external_states=ssm_external_states,
             plastic_states=None,
             update_plasticity=True,
         )
@@ -278,6 +358,7 @@ class NeuroSwiftLM(nn.Module):
             outputs = self(
                 next_token,
                 ssm_states=ssm_states,
+                ssm_external_states=ssm_external_states,
                 plastic_states=plastic_states,
                 update_plasticity=adapt_during_generation,
             )
@@ -318,7 +399,22 @@ class NeuroSwiftLM(nn.Module):
             json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
         )
         model = cls(config, use_checkpoint=use_checkpoint)
-        load_safetensors_model(model, save_dir / "model.safetensors", device=str(device))
+        # Bridge Logic: Safetensors doesn't support 'strict=False' natively in standard load
+        # so we load the tensor dictionary first and remap keys
+        from safetensors import safe_open
+        state_dict = {}
+        with safe_open(save_dir / "model.safetensors", framework="pt", device=str(device)) as f:
+            for k in f.keys():
+                new_k = k
+                # Remap dt_proj (V1) to dt_gate (V2 Selective SSD)
+                if ".ssm.dt_proj." in k:
+                    new_k = k.replace(".ssm.dt_proj.", ".ssm.dt_gate.")
+                state_dict[new_k] = f.get_tensor(k)
+        
+        # Load into model with strict=False to allow expert jitter and newer hooks
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[NeuroSwift Bridge] Info: Initialized new V2 weights: {len(missing)} keys")
         model.to(device)
         model.eval()
         return model

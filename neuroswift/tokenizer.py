@@ -69,7 +69,9 @@ class CharTokenizer:
         return cls(stoi=tokenizer_payload["stoi"], itos=tokenizer_payload["itos"])
 
 
-TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?|[^\w\s]", re.IGNORECASE)
+# Multilingual Word Tokenizer supporting Devanagari, English, and more.
+# Uses \w (alphanumeric) with Unicode support if available.
+TOKEN_PATTERN = re.compile(r"[\w]+(?:'[\w]+)?|[^\w\s]", re.IGNORECASE | re.UNICODE)
 
 
 class WordTokenizer:
@@ -90,7 +92,9 @@ class WordTokenizer:
         unique_tokens = set()
         for text in text_list:
             normalized = text.lower() if lowercase else text
-            unique_tokens.update(TOKEN_PATTERN.findall(normalized))
+            # Captures Hindi/Sanskrit words correctly via Unicode-aware pattern
+            tokens = TOKEN_PATTERN.findall(normalized)
+            unique_tokens.update(tokens)
 
         for token in sorted(unique_tokens):
             if token not in vocab:

@@ -48,15 +48,15 @@ def _info(text: str) -> None:
 
 
 def _banner() -> None:
-    print(_bold("\n  ██╗     ██╗███████╗██╗    ██╗██████╗    "))
-    print(_bold("  ██║     ██║██╔════╝██║    ██║██╔══██╗   "))
-    print(_bold("  ██║     ██║█████╗  ██║ █╗ ██║╚█████╔╝   "))
-    print(_bold("  ██║     ██║██╔══╝  ██║███╗██║██╔══██╗   "))
-    print(_bold("  ███████╗██║██║     ╚███╔███╔╝██║  ██║   "))
-    print(_bold("  ╚══════╝╚═╝╚═╝      ╚══╝╚══╝ ╚═╝  ╚═╝   "))
+    print(_bold("\n  ███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗ ███████╗██╗    ██╗██╗███████╗████████╗"))
+    print(_bold("  ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗██╔════╝██║    ██║██║██╔════╝╚══██╔══╝"))
+    print(_bold("  ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║███████╗██║ █╗ ██║██║█████╗     ██║   "))
+    print(_bold("  ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║╚════██║██║███╗██║██║██╔══╝     ██║   "))
+    print(_bold("  ██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝███████║╚███╔███╔╝██║██║        ██║   "))
+    print(_bold("  ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝ ╚══╝╚══╝ ╚═╝╚═╝        ╚═╝   "))
     print()
-    print("  NeuroSwift — World-class Multimodal Deep Learning")
-    print("  CPU-first • SSM+MoE+Plasticity • Omni generation")
+    print("  NeuroSwift — The Invincible Auto-Intelligence V3")
+    print("  CPU-First • DDS + SSM + MoE • Omni-Generation")
     print()
 
 
@@ -117,6 +117,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
     train_args.expert_hidden = args.expert_hidden
     train_args.prompt = args.prompt
     train_args.fetch_urls = args.fetch_urls
+    train_args.hf_dataset = args.hf_dataset
+    train_args.kaggle_dataset = args.kaggle_dataset
     train_args.device = args.device
     train_args.resume = args.resume
     train_args.legacy_checkpoint = None
@@ -168,8 +170,9 @@ def _add_train_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--output-dir", type=Path, default=Path("artifacts/neuroswift-tiny"))
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--resume", action="store_true")
-    p.add_argument("--prompt", type=str, default="what is neuroswift?")
     p.add_argument("--fetch-urls", action="store_true")
+    p.add_argument("--hf-dataset", type=str, default=None, help="Comma-sep HF repos")
+    p.add_argument("--kaggle-dataset", type=str, default=None, help="Comma-sep Kaggle datasets")
     p.set_defaults(func=_cmd_train)
 
 

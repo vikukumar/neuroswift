@@ -109,6 +109,8 @@ Examples:
                    help="Single prompt to answer.")
     p.add_argument("--device", type=str, default=None,
                    help="cpu / cuda / mps (default: auto).")
+    p.add_argument("--ternary", action="store_true",
+                   help="Force model into addition-only (1.58-bit) execution mode.")
 
     # Data context for RAG
     rag_grp = p.add_argument_group("RAG / Data Context")
@@ -155,7 +157,7 @@ Examples:
 # ---------------------------------------------------------------------------
 
 
-def load_model_and_tokenizer(model_dir: Path, device: torch.device):
+def load_model_and_tokenizer(model_dir: Path, device: torch.device, ternary_mode: bool = False):
     """Auto-detect and load NeuroSwiftLM or NeuroSwiftOmni."""
     from neuroswift.tokenizer import load_tokenizer
 
@@ -176,6 +178,12 @@ def load_model_and_tokenizer(model_dir: Path, device: torch.device):
     else:
         from neuroswift.model import NeuroSwiftLM
         model = NeuroSwiftLM.from_pretrained(model_dir, device=device)
+        if ternary_mode:
+            model.config.ternary_mode = True
+            # Re-initialize ternary layers if needed or just trigger the logic
+            for m in model.modules():
+                if hasattr(m, "ternary_enabled"):
+                    m.ternary_enabled = True
         return model, tokenizer, "lm"
 
 
@@ -270,7 +278,7 @@ def batch_evaluate(
     """
     Evaluate on a JSONL file of {prompt, response} pairs.
 
-    Returns metrics: avg_token_f1, min_f1, max_f1, pct_nonzero.
+    Returns metrics: avg_token_f1, min_f1, max_f1, pct_nonzero, avg_perplexity.
     """
     # Use data_pipeline to ingest eval pairs
     train_pairs, _, _ = run_pipeline(
@@ -288,6 +296,8 @@ def batch_evaluate(
 
     eos_id = tokenizer.eos_token_id
     f1_scores: list[float] = []
+    total_log_ppl = 0.0
+    valid_ppl_cnt = 0
 
     for pair in pairs:
         prompt_text = f"user: {pair.prompt}\nassistant:"
@@ -321,15 +331,33 @@ def batch_evaluate(
 
         f1 = _token_match_rate(pred, pair.response)
         f1_scores.append(f1)
+        
+        # Perplexity calculation (Cross-Entropy on reference response)
+        try:
+            full_text = f"{prompt_text} {pair.response}"
+            full_ids = torch.tensor([tokenizer.encode(full_text)], dtype=torch.long, device=device)
+            with torch.no_grad():
+                out = model(full_ids)
+                logits = out["logits"][:, prompt_ids.size(1)-1:-1]
+                labels = full_ids[:, prompt_ids.size(1):]
+                # Shift for CE
+                ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="mean")
+                total_log_ppl += ce.item()
+                valid_ppl_cnt += 1
+        except Exception:
+            pass
 
     if not f1_scores:
         return {}
 
     avg_f1 = sum(f1_scores) / len(f1_scores)
     pct_nonzero = sum(1 for s in f1_scores if s > 0.0) / len(f1_scores)
+    avg_ppl = math.exp(total_log_ppl / valid_ppl_cnt) if valid_ppl_cnt > 0 else 0.0
+    
     return {
         "num_examples": len(f1_scores),
         "avg_token_f1": avg_f1,
+        "avg_perplexity": avg_ppl,
         "min_f1": min(f1_scores),
         "max_f1": max(f1_scores),
         "pct_nonzero": pct_nonzero,
@@ -350,7 +378,7 @@ def main() -> None:
     # Load model
     logger.info(f"Loading model from {args.model_dir} …")
     try:
-        model, tokenizer, model_type = load_model_and_tokenizer(args.model_dir, device)
+        model, tokenizer, model_type = load_model_and_tokenizer(args.model_dir, device, ternary_mode=args.ternary)
     except FileNotFoundError as exc:
         logger.error(str(exc))
         sys.exit(1)

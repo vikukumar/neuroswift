@@ -20,9 +20,10 @@ def main():
     trainer = AutoTrainer(
         data_dir=data_dir,
         output_dir=output_dir,
-        use_ssd=True, # Force SSD-backed streaming
+        use_ssd=True, # Force SSD-backed streaming (Mamba-2 style)
         epochs_per_cycle=1,
-        save_every=100
+        save_every=100,
+        ternary_mode=True # Enable BitNet-style addition-only training (1.58-bit)
     )
     
     # Run one cycle

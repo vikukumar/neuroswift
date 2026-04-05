@@ -36,7 +36,12 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, List, Dict
+import datetime
+import requests
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
 
 logger = logging.getLogger(__name__)
  
@@ -48,6 +53,9 @@ _EXACT_MAPPINGS = [
     ("query", "response"), ("input", "output"), ("input", "target"),
     ("prompt", "completion"), ("text", "target"), ("context", "answer"),
     ("user", "assistant"), ("human", "assistant"), ("q", "a"),
+    # Auto-Intelligence Domains
+    ("problem", "solution"), ("verse", "translation"), ("article", "description"),
+    ("section", "description"), ("law", "details"), ("concept", "explanation"),
 ]
 _MESSAGE_KEYS = ("role", "content")
 _SHAREGPT_KEYS = ("from", "value")
@@ -148,6 +156,55 @@ class UniversalSchemaMapper:
 
         # 4. Fuzzy match pass
         keys = list(obj.keys())
+
+
+class WebScraper:
+    """
+    High-performance, parallelized Web Scraper for real-time RAG updates.
+    
+    Fetches raw HTML, strips noise (ads, scripts, nav), and returns 
+    clean markdown-style text for SSI state injection.
+    """
+    def __init__(self, max_workers: int = 8, timeout: int = 10) -> None:
+        self.max_workers = max_workers
+        self.timeout = timeout
+        self.headers = {
+            "User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"
+        }
+
+    def fetch_all(self, urls: List[str]) -> List[Dict[str, str]]:
+        """Parallel fetch multiple URLs for ultra-fast RAG updates."""
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_url = {executor.submit(self.scrape, url): url for url in urls}
+            for future in future_to_url:
+                try:
+                    res = future.result()
+                    if res:
+                        # Convert dict to flat string for RAG if needed, 
+                        # but here we keep dict for the list return.
+                        results.append(res)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {future_to_url[future]}: {e}")
+        return results
+
+    @staticmethod
+    def scrape(url: str, timeout: int = 10) -> str:
+        """Fetch and clean a single URL, returning raw text."""
+        headers = {"User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for s in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                s.decompose()
+            
+            text = soup.get_text(separator="\n")
+            lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 30]
+            return "\n".join(lines[:100])
+        except Exception as e:
+            return f"[Scrape Error] {url}: {e}"
         p_key, r_key = None, None
         
         # Heuristic: longest text is usually the response, second longest or 'question' like is prompt
@@ -410,41 +467,34 @@ def ingest_directory(
     max_pairs_per_file: int = 10_000,
     skip_exts: set[str] | None = None,
 ) -> tuple[list[TrainPair], PipelineStats]:
-    """
-    Recursively read all supported files from *data_dir*.
-
-    Args:
-        data_dir: Root folder to scan.
-        max_pairs_per_file: Cap extracted pairs per file (prevents huge imbalance).
-        skip_exts: Set of extensions to skip (e.g. ``{".wav"}``).
-
-    Returns:
-        ``(all_pairs, stats)`` where stats is a :class:`PipelineStats` snapshot.
-    """
+    """Recursively read all supported files from *data_dir* in parallel."""
     stats = PipelineStats()
     skip_exts = skip_exts or set()
     raw: list[TrainPair] = []
 
-    for path in sorted(data_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in skip_exts:
-            continue
-        if path.suffix.lower() not in _EXT_READERS:
-            continue
+    files = [
+        p for p in sorted(data_dir.rglob("*"))
+        if p.is_file() and p.suffix.lower() not in skip_exts and p.suffix.lower() in _EXT_READERS
+    ]
+    if not files:
+        return [], stats
 
-        stats.raw_files += 1
-        file_pairs = 0
+    stats.raw_files = len(files)
+
+    def _worker(path: Path):
         try:
-            for pair in ingest_path(path):
-                raw.append(pair)
-                stats.raw_pairs += 1
-                file_pairs += 1
-                if file_pairs >= max_pairs_per_file:
-                    logger.debug(f"Pair cap ({max_pairs_per_file}) reached for {path}")
-                    break
+            pairs = list(ingest_path(path))
+            return pairs[:max_pairs_per_file]
         except Exception as exc:
             logger.warning(f"Failed reading {path}: {exc}")
+            return []
+
+    with ThreadPoolExecutor(max_workers=min(16, len(files))) as executor:
+        results = list(executor.map(_worker, files))
+
+    for file_pairs in results:
+        raw.extend(file_pairs)
+        stats.raw_pairs += len(file_pairs)
 
     return raw, stats
 
@@ -516,9 +566,9 @@ def _is_repetitive(text: str, n: int = 4, threshold: float = 0.35) -> bool:
 def filter_pair(
     pair: TrainPair,
     min_prompt_words: int = 2,
-    max_prompt_words: int = 512,
+    max_prompt_words: int = 2048, # Increased for V3 context
     min_response_words: int = 3,
-    max_response_words: int = 1024,
+    max_response_words: int = 4096, # Increased for V3 answers
     stats: PipelineStats | None = None,
 ) -> bool:
     """Return True if the pair passes all quality filters."""
@@ -530,7 +580,10 @@ def filter_pair(
     pw = _word_count(pair.prompt)
     rw = _word_count(pair.response)
 
-    if pw < min_prompt_words or rw < min_response_words:
+    # Adaptive Scaling: If it's a table/math modality, allow shorter responses
+    effective_min_resp = 1 if pair.modality in ("table", "math", "qa") else min_response_words
+
+    if pw < min_prompt_words or rw < effective_min_resp:
         if stats:
             stats.skipped_too_short += 1
         return False
@@ -554,9 +607,12 @@ def filter_pair(
 
 
 def _fingerprint(text: str) -> str:
-    """Quick exact-dedup fingerprint: lowercased first 200 chars."""
-    normalized = re.sub(r"\s+", " ", text.lower().strip())[:200]
-    return hashlib.md5(normalized.encode()).hexdigest()
+    """
+    Robust SHA-256 fingerprint of the full text. 
+    Fixes V1/V2 collision bug where long prompts with identical instructions
+    were incorrectly flagged as duplicates.
+    """
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def _simhash(text: str, bits: int = 64) -> int:
@@ -577,51 +633,57 @@ def _hamming(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+def _get_marks(pair: TrainPair):
+    """Worker to compute exact and near fingerprints."""
+    return _fingerprint(pair.prompt + " " + pair.response), _simhash(pair.response)
+
+
 def deduplicate(
     pairs: list[TrainPair],
     exact: bool = True,
     near_dup: bool = True,
     near_threshold: int = 6,
     stats: PipelineStats | None = None,
+    use_multiprocessing: bool = False
 ) -> list[TrainPair]:
     """
     Remove duplicate and near-duplicate pairs.
-
-    Args:
-        pairs: Input pairs.
-        exact: Perform exact deduplication (MD5 fingerprint on prompt+response).
-        near_dup: Perform near-duplicate removal via simhash on response.
-        near_threshold: Max hamming distance to classify as near-duplicate.
-        stats: Optional stats counter.
-
-    Returns:
-        Deduplicated list.
+    Scales to millions of pairs using pre-computed parallel fingerprints.
     """
-    seen_exact: set[str] = set()
-    simhashes: list[int] = []
-    out: list[TrainPair] = []
+    if not pairs:
+        return []
+
+    # Parallelize fingerprinting (CPU-bound, GIL-bypass)
+    if use_multiprocessing and len(pairs) > 500:
+        num_procs = min(multiprocessing.cpu_count(), 16)
+        with ProcessPoolExecutor(max_workers=num_procs) as executor:
+            marks = list(executor.map(_get_marks, pairs))
+    else:
+        marks = [_get_marks(p) for p in pairs]
+
+    seen_exact = set()
+    simhashes = []
+    unique = []
     removed = 0
 
-    for pair in pairs:
-        key = _fingerprint(pair.prompt + " " + pair.response)
+    for pair, (key, sh) in zip(pairs, marks):
         if exact and key in seen_exact:
             removed += 1
             continue
         seen_exact.add(key)
 
         if near_dup:
-            sh = _simhash(pair.response)
             is_near = any(_hamming(sh, other) <= near_threshold for other in simhashes)
             if is_near:
                 removed += 1
                 continue
             simhashes.append(sh)
 
-        out.append(pair)
+        unique.append(pair)
 
     if stats:
         stats.skipped_dedup = removed
-    return out
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +773,10 @@ def split_train_val(
 
 
 def run_pipeline(
-    source: Path,
+    source: Path | list[Path] | None,
     *,
+    hf_dataset: str | list[str] | None = None,
+    kaggle_dataset: str | list[str] | None = None,
     max_total_pairs: int = 50_000,
     max_pairs_per_file: int = 10_000,
     min_prompt_words: int = 1,
@@ -734,6 +798,8 @@ def run_pipeline(
 
     Args:
         source: Path to a file or directory.
+        hf_dataset: Optional Hugging Face dataset name (e.g. "fka/awesome-chatgpt-prompts").
+        kaggle_dataset: Optional Kaggle dataset name (e.g. "user/dataset-name").
         max_total_pairs: Hard cap on total pairs after all stages.
         max_pairs_per_file: Cap pairs per file to prevent one file dominating.
         min/max_prompt_words: Word-count filter bounds for prompts.
@@ -751,21 +817,49 @@ def run_pipeline(
     Returns:
         ``(train_pairs, val_pairs, stats)``
     """
-    # 1+2. Ingest
-    if source.is_dir():
-        raw, stats = ingest_directory(
-            source,
-            max_pairs_per_file=max_pairs_per_file,
-            skip_exts=skip_exts,
-        )
-    else:
-        raw, stats = ingest_file(source, max_pairs=max_pairs_per_file)
+    # 0. Multi-Source Ingestion (Auto-Intelligence V3)
+    sources: list[Path] = []
+    if source:
+        if isinstance(source, list):
+            sources.extend(source)
+        else:
+            sources.append(source)
+
+    if hf_dataset or kaggle_dataset:
+        from neuroswift.dataset_downloader import download_from_hf, download_from_kaggle
+        if hf_dataset:
+            sources.extend(download_from_hf(hf_dataset))
+        if kaggle_dataset:
+            sources.extend(download_from_kaggle(kaggle_dataset))
+
+    # 1+2. Ingest ALL
+    raw: list[TrainPair] = []
+    stats = PipelineStats()
+    
+    for s_path in sources:
+        if s_path.is_dir():
+            s_raw, s_stats = ingest_directory(
+                s_path,
+                max_pairs_per_file=max_pairs_per_file,
+                skip_exts=skip_exts,
+            )
+        else:
+            s_raw, s_stats = ingest_file(s_path, max_pairs=max_pairs_per_file)
+        
+        raw.extend(s_raw)
+        stats.raw_files += s_stats.raw_files
+        stats.raw_pairs += s_stats.raw_pairs
 
     if verbose:
-        logger.info(f"Ingested {stats.raw_pairs:,} raw pairs from {stats.raw_files} files")
+        logger.info(f"Ingested {stats.raw_pairs:,} total raw pairs from {stats.raw_files} files/sources")
 
-    # 3. Normalize
-    normed = [normalize_pair(p) for p in raw]
+    # 3. Normalize (GIL-Bypass Parallel)
+    num_procs = min(multiprocessing.cpu_count(), 16)
+    if len(raw) > 500:
+        with ProcessPoolExecutor(max_workers=num_procs) as executor:
+            normed = list(executor.map(normalize_pair, raw))
+    else:
+        normed = [normalize_pair(p) for p in raw]
     stats.after_normalize = len(normed)
 
     # 4. Filter
@@ -781,13 +875,14 @@ def run_pipeline(
     if verbose:
         logger.info(f"After filter: {stats.after_filter:,} pairs")
 
-    # 5. Deduplicate
+    # 5. Deduplicate (GIL-Bypass Parallel Fingerprinting)
     deduped = deduplicate(
         filtered,
         exact=dedup_exact,
         near_dup=dedup_near,
         near_threshold=near_threshold,
         stats=stats,
+        use_multiprocessing=True
     )
     stats.after_dedup = len(deduped)
     if verbose:

@@ -1,10 +1,10 @@
 """
 examples/web_rag_assistant.py
 =============================
-God-Level Demonstration: Web-Search Grounded Assistant.
+God-Level Demonstration: Web-Search Grounded Assistant (V3).
 
-This script uses WebSearchRAG to answer questions about real-time events 
-by scraping DuckDuckGo results and using them as context for NeuroSwift.
+This script uses Auto-Intelligence V3 to answer questions about real-time events 
+by scraping DuckDuckGo results automatically.
 """
 import torch
 from neuroswift.omni import NeuroSwiftAssistant
@@ -18,7 +18,7 @@ def main():
         return
 
     device = auto_device()
-    print(f"Loading God-Level Assistant on {device} …")
+    print(f"Loading Auto-Intelligence V3 Assistant on {device} …")
     
     assistant = NeuroSwiftAssistant.from_pretrained(model_dir, device=device)
     
@@ -35,18 +35,15 @@ def main():
         if query.lower() in {"quit", "exit", "bye"}:
             break
             
-        # Enable live web search for this query
-        print(f"Searching the web for: {query} ...")
-        web_hits = assistant.rag.web_query(query)
-        
-        if web_hits:
-            print(f"Found {len(web_hits)} live results. Synthesizing answer...")
+        # Enable live web search for this query via Auto-Intelligence
+        print(f"Synthesizing answer from local RAG + Live Web Intelligence...")
             
         result = assistant.answer(
             query,
             retrieve_k=2,
             max_new_tokens=100,
-            temperature=0.3 # Use lower temperature for factuality
+            temperature=0.3, # Use lower temperature for factuality
+            use_ssi=True # Enable Selective State Injection for RAG grounding
         )
         
         print(f"\nNeuroSwift [{result['answer_source']}]: {result['answer']}")

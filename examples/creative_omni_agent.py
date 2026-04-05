@@ -1,10 +1,10 @@
 """
 examples/creative_omni_agent.py
 ================================
-God-Level Demonstration: Multimodal Omni Generation.
+God-Level Demonstration: Multimodal Omni Generation (V3).
 
-This script uses a single NeuroSwiftOmni model to generate synchronized 
-media (Image, Audio, Video) from a single text prompt.
+This script uses the Invincible V3 Alpha (God-Mode) architecture to generate 
+synchronized media (Image, Audio, Video) from a single text prompt.
 """
 import torch
 from neuroswift.omni import NeuroSwiftOmni
@@ -19,7 +19,8 @@ def main():
         return
 
     device = auto_device()
-    print(f"Loading God-Level Omni Model on {device} …")
+    print(f"Loading Invincible V3 Alpha (God-Mode) Omni Model on {device} …")
+    print("Architecture: Dynamic Depth Scaling (DDS) + Multi-Head Latent Attention (MLA)")
     
     model = NeuroSwiftOmni.from_pretrained(model_dir, device=device)
     tokenizer = load_tokenizer(model_dir)
@@ -40,7 +41,7 @@ def main():
             modality=modality,
             out_dir=out_dir
         )
-        print(f"  Artifact saved to {out_dir}/{modality}")
+        print(f"  Artifact refined via Neural Pixel Refinement (NPR) -> {out_dir}/{modality}")
         
     print(f"\nGeneration complete! All creative artifacts are in: {out_dir}")
 

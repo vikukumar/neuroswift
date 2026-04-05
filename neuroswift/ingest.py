@@ -53,6 +53,12 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 URL_EXTENSIONS = {".url", ".urls"}
+PDF_EXTENSIONS = {".pdf"}
+LOG_EXTENSIONS = {".log", ".out", ".err", ".msg"}
+CODE_EXTENSIONS = {
+    ".py", ".ipynb", ".js", ".mjs", ".ts", ".tsx", ".c", ".cpp", ".cc", ".h", ".hpp", 
+    ".java", ".go", ".rs", ".php", ".rb", ".sh", ".bat", ".ps1", ".sql", ".css", ".html", ".xml"
+}
 
 
 @dataclass
@@ -181,6 +187,10 @@ class DatasetFolderReader:
             return self._read_video_file(path)
         if suffix in URL_EXTENSIONS:
             return self._read_url_file(path)
+        if suffix in PDF_EXTENSIONS:
+            return self._read_pdf_file(path)
+        if suffix in CODE_EXTENSIONS or suffix in LOG_EXTENSIONS:
+            return self._read_text_file(path, modality="code" if suffix in CODE_EXTENSIONS else "log")
         return None
 
     def fetch_url(self, url: str, timeout: float = 10.0) -> MultimodalSample:
@@ -203,17 +213,40 @@ class DatasetFolderReader:
             },
         )
 
-    def _read_text_file(self, path: Path) -> MultimodalSample:
+    def _read_text_file(self, path: Path, modality: str = "text") -> MultimodalSample:
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if path.suffix.lower() == ".txt":
+        if modality == "text" and path.suffix.lower() == ".txt":
             url_lines = [line.strip() for line in text.splitlines() if URL_LINE_RE.match(line.strip())]
             if url_lines:
                 return self._build_url_samples(url_lines, source_hint=str(path))
         return MultimodalSample(
-            modality="text",
+            modality=modality,
             source=str(path),
             text=text,
             metadata={"extension": path.suffix.lower()},
+        )
+
+    def _read_pdf_file(self, path: Path) -> MultimodalSample:
+        # Dual-Strategy PDF Extraction
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(path)
+            text = "\n".join([(p.extract_text() or "") for p in reader.pages])
+        except (ImportError, Exception):
+            # Fallback: Binary Block Extraction (extremely robust)
+            try:
+                raw = path.read_bytes()
+                # Basic PDF text block extraction using regex
+                text_blocks = re.findall(b"(\((?:[^()]*|\([^()]*\))*\))", raw)
+                text = " ".join([b.decode("latin1", "ignore")[1:-1] for b in text_blocks if len(b) > 5])
+            except:
+                text = f"[PDF Logic Error] File {path.name} is encrypted or corrupted."
+        
+        return MultimodalSample(
+            modality="pdf",
+            source=str(path),
+            text=text.strip(),
+            metadata={"filename": path.name}
         )
 
     def _read_json_file(self, path: Path) -> MultimodalSample:

@@ -39,6 +39,18 @@ from pathlib import Path
 from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
+ 
+# ---------------------------------------------------------------------------
+# Mapping Constants (God-Level Schema detection)
+# ---------------------------------------------------------------------------
+_EXACT_MAPPINGS = [
+    ("prompt", "response"), ("instruction", "output"), ("question", "answer"),
+    ("query", "response"), ("input", "output"), ("input", "target"),
+    ("prompt", "completion"), ("text", "target"), ("context", "answer"),
+    ("user", "assistant"), ("human", "assistant"), ("q", "a"),
+]
+_MESSAGE_KEYS = ("role", "content")
+_SHAREGPT_KEYS = ("from", "value")
 
 # ---------------------------------------------------------------------------
 # Core dataclass
@@ -110,13 +122,31 @@ class UniversalSchemaMapper:
     def map_obj(cls, obj: dict[str, Any], source: str = "") -> TrainPair | None:
         if not isinstance(obj, dict):
             return None
+
+        # 1. OpenAI Message Format Support
+        if "messages" in obj and isinstance(obj["messages"], list):
+            # Take last user message as prompt, last assistant as response
+            p, r = "", ""
+            for m in obj["messages"]:
+                if m.get("role") == "user": p = m.get("content", "")
+                elif m.get("role") == "assistant": r = m.get("content", "")
+            if p and r: return TrainPair(prompt=p, response=r, source=source)
+
+        # 2. ShareGPT Support
+        if "conversations" in obj and isinstance(obj["conversations"], list):
+            p, r = "", ""
+            for m in obj["conversations"]:
+                role = m.get("from")
+                if role in ("human", "user"): p = m.get("value", "")
+                elif role in ("gpt", "assistant"): r = m.get("value", "")
+            if p and r: return TrainPair(prompt=p, response=r, source=source)
         
-        # 1. Exact match pass
-        for pk, rk in _INSTRUCTION_KEYS:
+        # 3. Exact match pass
+        for pk, rk in _EXACT_MAPPINGS:
             p, r = str(obj.get(pk, "")).strip(), str(obj.get(rk, "")).strip()
             if p and r: return TrainPair(prompt=p, response=r, source=source)
 
-        # 2. Fuzzy match pass
+        # 4. Fuzzy match pass
         keys = list(obj.keys())
         p_key, r_key = None, None
         
@@ -139,7 +169,8 @@ class UniversalSchemaMapper:
 
         if p_key and r_key and p_key != r_key:
             p, r = str(obj[p_key]).strip(), str(obj[r_key]).strip()
-            if len(p) > 5 and len(r) > 10:
+            # Relaxed heuristic for short-form valid data
+            if len(p) > 2 and len(r) > 1:
                 return TrainPair(prompt=p, response=r, source=source)
         
         return None
@@ -302,7 +333,7 @@ def _read_xlsx(path: Path) -> Iterator[TrainPair]:
                         modality="table",
                     )
     except ImportError:
-        logger.warning("openpyxl not installed, skipping .xlsx files.")
+        logger.warning("openpyxl not installed, skipping .xlsx files. Tip: pip install openpyxl")
     except Exception as exc:
         logger.warning(f"Error reading XLSX {path}: {exc}")
 
@@ -684,9 +715,9 @@ def run_pipeline(
     *,
     max_total_pairs: int = 50_000,
     max_pairs_per_file: int = 10_000,
-    min_prompt_words: int = 2,
+    min_prompt_words: int = 1,
     max_prompt_words: int = 512,
-    min_response_words: int = 3,
+    min_response_words: int = 1,
     max_response_words: int = 1024,
     dedup_exact: bool = True,
     dedup_near: bool = True,

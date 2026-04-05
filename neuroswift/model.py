@@ -357,5 +357,33 @@ class NeuroSwiftLM(nn.Module):
         model = cls.from_pretrained(save_dir, device=device)
         return model, meta["step"], meta["loss"]
 
+    def evolve(self, new_config: NeuroSwiftConfig) -> "NeuroSwiftLM":
+        """
+        Transition current model to a new, larger config while keeping knowledge.
+        God-Level Progressive Growth functionality.
+        """
+        from .evolution import WeightEvolutionEngine
+        return WeightEvolutionEngine.evolve(self, new_config)
+
+    @staticmethod
+    def get_evolution_target(tokens_trained: int) -> Optional[dict[str, Any]]:
+        """
+        Suggest a next-level configuration based on trained dataset size.
+        """
+        # Thresholds (tokens)
+        T_SMALL = 100_000   # 100k tokens
+        T_MEDIUM = 1_000_000 # 1M tokens
+        T_LARGE = 10_000_000 # 10M tokens
+        T_HUGE = 100_000_000 # 100M tokens
+
+        if tokens_trained < T_SMALL: return None
+        if tokens_trained < T_MEDIUM:
+            return {"d_model": 192, "n_layers": 6, "expert_hidden": 384}
+        if tokens_trained < T_LARGE:
+            return {"d_model": 256, "n_layers": 8, "expert_hidden": 512}
+        if tokens_trained < T_HUGE:
+            return {"d_model": 512, "n_layers": 12, "expert_hidden": 1024}
+        return {"d_model": 768, "n_layers": 18, "expert_hidden": 1536}
+
 
 __all__ = ["NeuroSwiftBlock", "NeuroSwiftConfig", "NeuroSwiftLM"]

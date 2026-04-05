@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -128,6 +128,8 @@ class AutoTrainer:
         min_pairs: int = 4,            # minimum new pairs to trigger a training cycle
         plasticity_warmup: bool = True,
         freeze_first_n_layers: int = 0,  # freeze first N blocks for faster incremental updates
+        evolution: bool = False,       # Enable progressive model growth
+        use_ui: bool = True,          # Use rich live dashboard
         verbose: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -143,6 +145,8 @@ class AutoTrainer:
         self.min_pairs = min_pairs
         self.plasticity_warmup = plasticity_warmup
         self.freeze_first_n_layers = freeze_first_n_layers
+        self.evolution = evolution
+        self.use_ui = use_ui
         self.verbose = verbose
 
         # Adaptive batch size
@@ -160,6 +164,8 @@ class AutoTrainer:
         self.seen_files: set[str] = set()
         self.global_step: int = 0
         self.cycle: int = 0
+        self.total_tokens_trained: int = 0
+        self.ui_context: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Bootstrap / resume
@@ -229,7 +235,7 @@ class AutoTrainer:
             f"({trainable:,} trainable) on {self.device}"
         )
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
+            self.model.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
@@ -329,7 +335,7 @@ class AutoTrainer:
             self.seen_files.add(str(path))
 
         normed = [normalize_pair(p) for p in raw]
-        filtered = [p for p in normed if filter_pair(p, min_response_words=2)]
+        filtered = [p for p in normed if filter_pair(p, min_response_words=1)]
         deduped = deduplicate(filtered, exact=True, near_dup=False)
         return deduped
 
@@ -351,6 +357,8 @@ class AutoTrainer:
                     "cycle": self.cycle,
                     "seen_files": sorted(self.seen_files),
                     "device": str(self.device),
+                    "total_tokens_trained": self.total_tokens_trained,
+                    "evolution_enabled": self.evolution,
                 },
                 indent=2,
             ),
@@ -365,7 +373,8 @@ class AutoTrainer:
             self.global_step = int(state.get("global_step", 0))
             self.cycle = int(state.get("cycle", 0))
             self.seen_files = set(state.get("seen_files", []))
-            self._log(f"Restored state: step={self.global_step}, cycle={self.cycle}, seen_files={len(self.seen_files)}")
+            self.total_tokens_trained = int(state.get("total_tokens_trained", 0))
+            self._log(f"Restored state: step={self.global_step}, cycle={self.cycle}, tokens={self.total_tokens_trained}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -470,6 +479,27 @@ class AutoTrainer:
                 self._log(f"Training on {len(new_pairs)} new pairs …")
                 loss = self._train_pairs(new_pairs)
                 self._log(f"Cycle {self.cycle} done. Mean loss: {loss:.4f}")
+                
+                # Check for Evolution (Progressive Growth)
+                if self.evolution:
+                    target_config_dict = self.model.get_evolution_target(self.total_tokens_trained)
+                    if target_config_dict:
+                        # Check if it actually describes a larger model than current
+                        current_c = self.model.config
+                        if target_config_dict["d_model"] > current_c.d_model or target_config_dict["n_layers"] > current_c.n_layers:
+                            self._log(f"!!! TRIGGERING EVOLUTION !!! Tokens Trained: {self.total_tokens_trained:,}")
+                            new_c = NeuroSwiftConfig(
+                                vocab_size=current_c.vocab_size,
+                                d_model=target_config_dict["d_model"],
+                                n_layers=target_config_dict["n_layers"],
+                                d_state=current_c.d_state,
+                                expert_hidden=target_config_dict["expert_hidden"],
+                                # others stay same
+                            )
+                            self.model = self.model.evolve(new_c)
+                            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+                            self._checkpoint()
+
                 self._checkpoint()
 
                 if max_cycles > 0 and self.cycle >= max_cycles:

@@ -462,12 +462,22 @@ def ingest_path(path: Path) -> Iterator[TrainPair]:
     yield from reader_fn(path)
 
 
+def _ingest_worker(args: tuple[Path, int]) -> list[TrainPair]:
+    """Top-level worker for Windows multiprocessing compatibility."""
+    path, max_pairs = args
+    try:
+        pairs = list(ingest_path(path))
+        return pairs[:max_pairs]
+    except Exception:
+        return []
+
+
 def ingest_directory(
     data_dir: Path,
     max_pairs_per_file: int = 10_000,
     skip_exts: set[str] | None = None,
 ) -> tuple[list[TrainPair], PipelineStats]:
-    """Recursively read all supported files from *data_dir* in parallel."""
+    """Recursively read all files in parallel processes (GIL-bypass)."""
     stats = PipelineStats()
     skip_exts = skip_exts or set()
     raw: list[TrainPair] = []
@@ -481,16 +491,13 @@ def ingest_directory(
 
     stats.raw_files = len(files)
 
-    def _worker(path: Path):
-        try:
-            pairs = list(ingest_path(path))
-            return pairs[:max_pairs_per_file]
-        except Exception as exc:
-            logger.warning(f"Failed reading {path}: {exc}")
-            return []
-
-    with ThreadPoolExecutor(max_workers=min(16, len(files))) as executor:
-        results = list(executor.map(_worker, files))
+    # Use ProcessPool for initialization stages (PDF/Log parsing is CPU bound)
+    num_procs = min(multiprocessing.cpu_count(), 16)
+    worker_args = [(f, max_pairs_per_file) for f in files]
+    
+    with ProcessPoolExecutor(max_workers=num_procs) as executor:
+        # For ingestion, chunksize=1 is usually best as files vary in size
+        results = list(executor.map(_ingest_worker, worker_args, chunksize=1))
 
     for file_pairs in results:
         raw.extend(file_pairs)
@@ -653,11 +660,12 @@ def deduplicate(
     if not pairs:
         return []
 
-    # Parallelize fingerprinting (CPU-bound, GIL-bypass)
+    # Parallelize fingerprinting (CPU-bound, GIL-bypass, Chunked IPC)
     if use_multiprocessing and len(pairs) > 500:
         num_procs = min(multiprocessing.cpu_count(), 16)
         with ProcessPoolExecutor(max_workers=num_procs) as executor:
-            marks = list(executor.map(_get_marks, pairs))
+            # high chunksize to minimize overhead
+            marks = list(executor.map(_get_marks, pairs, chunksize=250))
     else:
         marks = [_get_marks(p) for p in pairs]
 
@@ -853,11 +861,11 @@ def run_pipeline(
     if verbose:
         logger.info(f"Ingested {stats.raw_pairs:,} total raw pairs from {stats.raw_files} files/sources")
 
-    # 3. Normalize (GIL-Bypass Parallel)
+    # 3. Normalize (GIL-Bypass Parallel, Chunked IPC)
     num_procs = min(multiprocessing.cpu_count(), 16)
     if len(raw) > 500:
         with ProcessPoolExecutor(max_workers=num_procs) as executor:
-            normed = list(executor.map(normalize_pair, raw))
+            normed = list(executor.map(normalize_pair, raw, chunksize=250))
     else:
         normed = [normalize_pair(p) for p in raw]
     stats.after_normalize = len(normed)

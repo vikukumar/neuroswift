@@ -333,7 +333,7 @@ def train_omni(args: Namespace) -> None:
     tokenizer = WordTokenizer.from_texts(texts)
     logger.info(f"Vocab size: {tokenizer.vocab_size}")
 
-    # 4. DataLoader
+    # 4. DataLoader (Non-blocking Extreme Speed)
     dataset = OmniDataset(train_pairs, mm_samples)
     collator = OmniCollate(
         tokenizer=tokenizer,
@@ -342,7 +342,16 @@ def train_omni(args: Namespace) -> None:
         max_video_frames=args.max_video_frames,
         video_frame_size=args.video_frame_size
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collator, drop_last=True)
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collator, 
+        drop_last=True,
+        num_workers=min(4, os.cpu_count() or 1),
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True if (os.cpu_count() or 1) >= 4 else False,
+    )
 
     # 5. Model
     config = NeuroSwiftOmniConfig(
@@ -363,7 +372,7 @@ def train_omni(args: Namespace) -> None:
 
     # 6. Optimizer + Schedule
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    scaler = torch.cuda.GradScaler() if device.type == "cuda" else None
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     
     total_steps = (len(loader) // args.grad_accum) * args.epochs
     warmup_steps = int(total_steps * 0.05)
@@ -380,18 +389,19 @@ def train_omni(args: Namespace) -> None:
         for i, batch in enumerate(loader):
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             
-            if scaler is not None:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    loss, _ = compute_omni_loss(model, batch, args.text_weight, args.image_weight, args.audio_weight, args.video_weight)
-                    loss = loss / args.grad_accum
-                scaler.scale(loss).backward()
-            else:
+            # Autocast with bfloat16 support (Ampere/H100/A100)
+            dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=dtype):
                 loss, _ = compute_omni_loss(model, batch, args.text_weight, args.image_weight, args.audio_weight, args.video_weight)
                 loss = loss / args.grad_accum
+            
+            if device.type == "cuda":
+                scaler.scale(loss).backward()
+            else:
                 loss.backward()
 
             if (i + 1) % args.grad_accum == 0 or (i + 1) == len(loader):
-                if scaler is not None:
+                if device.type == "cuda":
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)

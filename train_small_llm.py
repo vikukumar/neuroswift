@@ -128,7 +128,7 @@ def build_sft_tensors(
         worker_args = [(p, tokenizer, seq_len, fmt_prompt) for p in pairs]
         
         with ProcessPoolExecutor(max_workers=num_procs) as executor:
-            results = list(executor.map(_sft_worker, worker_args))
+            results = list(executor.map(_sft_worker, worker_args, chunksize=250))
         
         for res in results:
             if res is None:
@@ -452,6 +452,8 @@ def main() -> None:
             batch_size=batch_size,
             shuffle=True,
             pin_memory=True if device.type == "cuda" else False,
+            num_workers=min(4, os.cpu_count() or 1),
+            persistent_workers=True if (os.cpu_count() or 1) >= 4 else False,
             drop_last=True if len(train_inputs) >= batch_size else False,
         )
 

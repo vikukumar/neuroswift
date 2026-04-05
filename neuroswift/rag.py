@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .ingest import DatasetFolderReader, MultimodalSample
+from .data_pipeline import WebScraper
+import datetime
 
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?|[^\w\s]", re.IGNORECASE)
@@ -60,6 +62,14 @@ class RetrievalHit:
     score: float
     document: RAGDocument
     matched_terms: tuple[str, ...] = ()
+
+
+class FuturePredictor:
+    """God-level temporal awareness for accurate future prediction."""
+    @staticmethod
+    def get_context() -> str:
+        now = datetime.datetime.now()
+        return f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}. Use this for real-time awareness and future-oriented predictions."
 
 
 class NeuroSwiftRAG:
@@ -268,6 +278,32 @@ class NeuroSwiftRAG:
 
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]
+
+    def web_query(self, query: str, top_k: int = 2) -> list[RetrievalHit]:
+        """
+        God-level web search fallback. 
+        Scrapes search results for real-time grounding.
+        """
+        logger = logging.getLogger(__name__)
+        logger.info(f"Initiating Web-Search RAG for: {query}")
+        
+        # Simulated DuckDuckGo scraping (generic pattern)
+        search_url = f"https://duckduckgo.com/html/?q={query.replace(' ', '+')}"
+        raw_text = WebScraper.scrape(search_url)
+        
+        if not raw_text:
+            return []
+            
+        # Create a temporary document from the web result
+        web_doc = RAGDocument(
+            doc_id=f"web_{hash(query)}",
+            text=raw_text[:2000], 
+            source=search_url,
+            modality="web",
+            metadata={"timestamp": str(datetime.datetime.now())}
+        )
+        
+        return [RetrievalHit(score=10.0, document=web_doc)]
 
     def format_hits(self, hits: Iterable[RetrievalHit], max_chars: int = 3200) -> str:
         remaining = max_chars

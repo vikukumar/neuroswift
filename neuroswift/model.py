@@ -323,5 +323,39 @@ class NeuroSwiftLM(nn.Module):
         model.eval()
         return model
 
+    def compile(self, backend: str = "inductor", mode: str = "reduce-overhead") -> nn.Module:
+        """
+        God-level optimization: torch.compile fusion.
+        Requires Torch 2.0+ and a compatible toolchain.
+        """
+        if not hasattr(torch, "compile"):
+            logger.warning("torch.compile not available in this version of Torch.")
+            return self
+        try:
+            logger.info(f"Compiling model (backend={backend}) …")
+            return torch.compile(self, backend=backend, mode=mode)
+        except Exception as e:
+            logger.warning(f"Compilation failed: {e}. Falling back to eager.")
+            return self
+
+    def save_partial(self, directory: str | Path, step: int, loss: float) -> None:
+        """Save a resumable 'hot' checkpoint."""
+        save_dir = Path(directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = {"step": step, "loss": loss, "config": self.config.to_dict()}
+        (save_dir / "checkpoint_metadata.json").write_text(json.dumps(checkpoint, indent=2))
+        self.save_pretrained(save_dir)
+
+    @classmethod
+    def from_partial(cls, directory: str | Path, device: str | torch.device = "cpu") -> tuple[Optional["NeuroSwiftLM"], int, float]:
+        """Load from a partial checkpoint if it exists."""
+        save_dir = Path(directory)
+        meta_file = save_dir / "checkpoint_metadata.json"
+        if not meta_file.exists():
+            return None, 0, 0.0
+        meta = json.loads(meta_file.read_text())
+        model = cls.from_pretrained(save_dir, device=device)
+        return model, meta["step"], meta["loss"]
+
 
 __all__ = ["NeuroSwiftBlock", "NeuroSwiftConfig", "NeuroSwiftLM"]

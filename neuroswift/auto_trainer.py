@@ -170,8 +170,15 @@ class AutoTrainer:
         ckpt_path = self.output_dir / "model.safetensors"
         tok_path = self.output_dir / "tokenizer.json"
 
-        if ckpt_path.exists() and tok_path.exists():
-            self._log("Resuming from existing checkpoint …")
+        # Try to load partial model first (God-level resumption)
+        partial_model, step, loss = NeuroSwiftLM.from_partial(self.output_dir, device=self.device)
+        if partial_model is not None:
+            self._log(f"Resuming from partial checkpoint at step {step} (loss={loss:.4f}) …")
+            self.model = partial_model
+            self.tokenizer = WordTokenizer.from_pretrained(self.output_dir)
+            self.global_step = step
+        elif ckpt_path.exists() and tok_path.exists():
+            self._log("Resuming from existing full checkpoint …")
             self.tokenizer = WordTokenizer.from_pretrained(self.output_dir)
             self.model = NeuroSwiftLM.from_pretrained(self.output_dir, device=self.device)
         else:
@@ -243,11 +250,23 @@ class AutoTrainer:
             return float("nan")
 
         inputs, targets = result
-        loader = DataLoader(
-            TensorDataset(inputs, targets),
-            batch_size=self.batch_size,
-            shuffle=True,
-        )
+        
+        # Use God-level MmapDataset for very large data (SSD-backed streaming)
+        if len(pairs) > 5000:
+            from .streaming import MmapDataset
+            mmap_file = self.output_dir / f"stream_{self.cycle}.mmap"
+            self._log(f"Dataset too large for RAM. Streaming from SSD: {mmap_file}")
+            loader = DataLoader(
+                MmapDataset.from_pairs(pairs, self.tokenizer, mmap_file, seq_len=self.seq_len),
+                batch_size=self.batch_size,
+                shuffle=False, # MmapDataset is usually used for sequential or worker-split streaming
+            )
+        else:
+            loader = DataLoader(
+                TensorDataset(inputs, targets),
+                batch_size=self.batch_size,
+                shuffle=True,
+            )
         self.model.train()
         total_loss = 0.0
         n_batches = 0
@@ -270,6 +289,7 @@ class AutoTrainer:
                 self.global_step += 1
 
                 if self.global_step % self.save_every == 0:
+                    self.model.save_partial(self.output_dir, self.global_step, loss.item())
                     self._checkpoint()
 
             self._log(f"  Epoch {epoch + 1}/{self.epochs_per_cycle} — loss={total_loss / max(n_batches, 1):.4f}")

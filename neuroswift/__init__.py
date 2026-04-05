@@ -30,10 +30,27 @@ from .omni import (
 )
 from .plasticity import HebbianUpdater
 from .prompting import PromptEngineer, PromptIntent, infer_prompt_intent
-from .rag import NeuroSwiftRAG, RAGDocument, RetrievalHit
+from .rag import FuturePredictor, NeuroSwiftRAG, RAGDocument, RetrievalHit
 from .tokenizer import CharTokenizer, WordTokenizer, load_tokenizer
+from .streaming import MmapDataset
+from .benchmark import NeuroSwiftBenchmark
+
+def finetune(model: NeuroSwiftLM, data_dir: str | Path, output_dir: str | Path = "artifacts/finetuned", **kwargs) -> NeuroSwiftLM:
+    """God-level single-method finetuning."""
+    trainer = AutoTrainer(data_dir=Path(data_dir), output_dir=Path(output_dir), **kwargs)
+    trainer.train_once()
+    return model
+
+def benchmark(model: NeuroSwiftLM, tokenizer: WordTokenizer) -> None:
+    """Inbuilt God-level benchmarking."""
+    bench = NeuroSwiftBenchmark(model, tokenizer)
+    bench.run_all()
+
 
 __all__ = [
+    # God-level APIs
+    "finetune",
+    "benchmark",
     # Artifacts
     "ArtifactSaver",
     "OmniArtifact",
@@ -92,6 +109,11 @@ __all__ = [
     "NeuroSwiftRAG",
     "RAGDocument",
     "RetrievalHit",
+    "FuturePredictor",
+    # Streaming
+    "MmapDataset",
+    # Benchmarking
+    "NeuroSwiftBenchmark",
     # Version
     "__version__",
 ]

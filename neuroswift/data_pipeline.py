@@ -98,61 +98,75 @@ class PipelineStats:
 # Stage 1 + 2: Ingest & Extract
 # ---------------------------------------------------------------------------
 
-_INSTRUCTION_KEYS = [
-    ("prompt", "response"),
-    ("instruction", "output"),
-    ("input", "output"),
-    ("question", "answer"),
-    ("human", "assistant"),
-    ("user", "assistant"),
-    ("query", "answer"),
-    ("q", "a"),
-]
+class UniversalSchemaMapper:
+    """
+    God-level schema mapper that automatically finds 'prompt' and 'response' 
+    like fields in any dictionary using fuzzy matching and heuristics.
+    """
+    _PROMPT_HINTS = {"prompt", "instruction", "input", "question", "human", "user", "query", "q", "title", "header", "topic"}
+    _RESP_HINTS = {"response", "output", "answer", "assistant", "gpt", "model", "a", "body", "content", "text", "summary", "description"}
+
+    @classmethod
+    def map_obj(cls, obj: dict[str, Any], source: str = "") -> TrainPair | None:
+        if not isinstance(obj, dict):
+            return None
+        
+        # 1. Exact match pass
+        for pk, rk in _INSTRUCTION_KEYS:
+            p, r = str(obj.get(pk, "")).strip(), str(obj.get(rk, "")).strip()
+            if p and r: return TrainPair(prompt=p, response=r, source=source)
+
+        # 2. Fuzzy match pass
+        keys = list(obj.keys())
+        p_key, r_key = None, None
+        
+        # Heuristic: longest text is usually the response, second longest or 'question' like is prompt
+        sorted_by_len = sorted([k for k in keys if isinstance(obj[k], str)], key=lambda k: len(str(obj[k])), reverse=True)
+        
+        if not sorted_by_len: return None
+
+        # Look for indicators
+        for k in sorted_by_len:
+            lk = k.lower()
+            if any(hint in lk for hint in cls._RESP_HINTS) and not r_key:
+                r_key = k
+            elif any(hint in lk for hint in cls._PROMPT_HINTS) and not p_key:
+                p_key = k
+
+        # Fallback: take longest as response, second longest as prompt if no hints found
+        if not r_key: r_key = sorted_by_len[0]
+        if not p_key and len(sorted_by_len) > 1: p_key = sorted_by_len[1]
+
+        if p_key and r_key and p_key != r_key:
+            p, r = str(obj[p_key]).strip(), str(obj[r_key]).strip()
+            if len(p) > 5 and len(r) > 10:
+                return TrainPair(prompt=p, response=r, source=source)
+        
+        return None
 
 
 def _extract_pair_from_dict(obj: dict[str, Any], source: str = "") -> TrainPair | None:
-    """Try all known key combinations to extract a prompt/response pair."""
-    for pk, rk in _INSTRUCTION_KEYS:
-        p = str(obj.get(pk, "")).strip()
-        r = str(obj.get(rk, "")).strip()
-        if p and r:
-            return TrainPair(prompt=p, response=r, source=source)
+    """Delegates to UniversalSchemaMapper."""
+    return UniversalSchemaMapper.map_obj(obj, source=source)
 
-    # OpenAI / ShareGPT messages format
-    messages = obj.get("messages") or obj.get("conversations") or obj.get("conversation")
-    if isinstance(messages, list):
-        user_msgs, asst_msgs = [], []
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            role = str(msg.get("role") or msg.get("from") or "").strip().lower()
-            content = str(msg.get("content") or msg.get("value") or "").strip()
-            if not content:
-                continue
-            if role in {"user", "human"}:
-                user_msgs.append(content)
-            elif role in {"assistant", "gpt", "model"}:
-                asst_msgs.append(content)
-        # Build multi-turn: last user -> last assistant
-        if user_msgs and asst_msgs:
-            return TrainPair(
-                prompt=user_msgs[-1],
-                response=asst_msgs[-1],
-                source=source,
-            )
-        # Build first-pair only as fallback
-        if user_msgs and asst_msgs:
-            return TrainPair(prompt=user_msgs[0], response=asst_msgs[0], source=source)
 
-    # Alpaca style: instruction + optional input
-    inst = str(obj.get("instruction", "")).strip()
-    inp = str(obj.get("input", "")).strip()
-    out = str(obj.get("output", "")).strip()
-    if inst and out:
-        prompt = f"{inst}\n{inp}".strip() if inp else inst
-        return TrainPair(prompt=prompt, response=out, source=source)
-
-    return None
+class WebScraper:
+    """Simple inbuilt web scraper for URL ingestion."""
+    @staticmethod
+    def scrape(url: str) -> str:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Remove scripts/styles
+            for script in soup(["script", "style"]):
+                script.decompose()
+            return soup.get_text(separator=" ", strip=True)
+        except Exception as e:
+            logger.debug(f"Scrape failed for {url}: {e}")
+            return ""
 
 
 def _read_jsonl(path: Path, cap_bytes: int = 50 * 1024 * 1024) -> Iterator[TrainPair]:

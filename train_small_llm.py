@@ -42,10 +42,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from neuroswift.data_pipeline import TrainPair, run_pipeline
+from neuroswift.data_pipeline import TrainPair, run_pipeline, UniversalSchemaMapper
 from neuroswift.layers import auto_device
 from neuroswift.model import NeuroSwiftConfig, NeuroSwiftLM
 from neuroswift.tokenizer import WordTokenizer
+from neuroswift.streaming import MmapDataset
 
 logging.basicConfig(
     level=logging.INFO,
@@ -255,6 +256,10 @@ Examples:
     arch_grp.add_argument("--dropout", type=float, default=0.05)
     arch_grp.add_argument("--grad-checkpoint", action="store_true",
                           help="Enable gradient checkpointing (saves memory, slower).")
+    arch_grp.add_argument("--compile", action="store_true",
+                          help="Enable torch.compile() for massive speedup (requires Torch 2.0+).")
+    arch_grp.add_argument("--use-ssd", action="store_true",
+                          help="Force SSD-backed MmapDataset (even for small datasets).")
 
     # Output / misc
     out_grp = p.add_argument_group("Output")
@@ -382,35 +387,43 @@ def main() -> None:
 
     # ── Tensor datasets ─────────────────────────────────────────────────────
     logger.info("Tokenizing training pairs …")
-    train_inputs, train_labels, skipped_train = build_sft_tensors(
-        train_pairs, tokenizer, seq_len=args.seq_len
-    )
-    logger.info(f"Training tensors: {len(train_inputs):,} examples ({skipped_train} skipped)")
+    
+    use_ssd = args.use_ssd or (len(train_pairs) > 10000)
+    
+    if use_ssd:
+        mmap_path = args.output_dir / "train_cache.mmap"
+        logger.info(f"SSD-Streaming enabled: writing tokens to {mmap_path}")
+        train_loader = DataLoader(
+            MmapDataset.from_pairs(train_pairs, tokenizer, mmap_path, seq_len=args.seq_len),
+            batch_size=batch_size,
+            shuffle=False, 
+        )
+        train_inputs = train_pairs # marker for auto_model_size
+    else:
+        train_inputs, train_labels, skipped_train = build_sft_tensors(
+            train_pairs, tokenizer, seq_len=args.seq_len
+        )
+        logger.info(f"Training tensors: {len(train_inputs):,} examples ({skipped_train} skipped)")
+        train_loader = DataLoader(
+            TensorDataset(train_inputs, train_labels),
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True if len(train_inputs) >= batch_size else False,
+        )
 
     has_val = len(val_pairs) > 0
-    val_inputs: torch.Tensor | None = None
-    val_labels: torch.Tensor | None = None
-    if has_val:
-        val_inputs, val_labels, skipped_val = build_sft_tensors(
-            val_pairs, tokenizer, seq_len=args.seq_len
-        )
-        logger.info(f"Validation tensors: {len(val_inputs):,} examples ({skipped_val} skipped)")
-        if len(val_inputs) == 0:
-            has_val = False
-
-    train_loader = DataLoader(
-        TensorDataset(train_inputs, train_labels),
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True if len(train_inputs) >= batch_size else False,
-    )
     val_loader: DataLoader | None = None
-    if has_val and val_inputs is not None and val_labels is not None:
-        val_loader = DataLoader(
-            TensorDataset(val_inputs, val_labels),
-            batch_size=batch_size * 2,
-            shuffle=False,
-        )
+    if has_val:
+        v_inputs, v_labels, skipped_val = build_sft_tensors(val_pairs, tokenizer, seq_len=args.seq_len)
+        logger.info(f"Validation tensors: {len(v_inputs):,} examples ({skipped_val} skipped)")
+        if len(v_inputs) > 0:
+            val_loader = DataLoader(
+                TensorDataset(v_inputs, v_labels),
+                batch_size=batch_size * 2,
+                shuffle=False,
+            )
+        else:
+            has_val = False
 
     # ── Model ───────────────────────────────────────────────────────────────
     d_model_arg = args.d_model
@@ -461,6 +474,10 @@ def main() -> None:
             aux_loss_scale=1e-2,
         )
         model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
+
+    # Optional torch.compile (God-level optimized)
+    if args.compile:
+        model = model.compile()
 
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
@@ -545,8 +562,8 @@ def main() -> None:
                 epoch_loss += (ce_loss.item() * args.grad_accum)
 
                 if args.save_every > 0 and global_step % args.save_every == 0:
-                    _save_checkpoint(model, tokenizer, args, last_train_loss)
-                    logger.info(f"  [step {global_step}] checkpoint saved.")
+                    model.save_partial(args.output_dir, global_step, loss.item())
+                    logger.info(f"  [step {global_step}] hot-checkpoint saved.")
 
         mean_train_loss = epoch_loss / max(n_steps, 1)
         last_train_loss = mean_train_loss

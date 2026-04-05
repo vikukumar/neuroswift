@@ -15,6 +15,7 @@ chat          Interactive REPL using NeuroSwiftAssistant
 index         Index a folder into the RAG store  (saves rag.json)
 generate      Generate image / audio / video from a text prompt
 auto-train    Continuous background training loop (WorldAutoTrain)
+benchmark     Run God-level performance and accuracy benchmarks
 
 Examples::
 
@@ -458,6 +459,41 @@ def _add_auto_train_parser(sub: argparse._SubParsersAction) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sub-command: benchmark
+# ---------------------------------------------------------------------------
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> None:
+    import torch
+    from .model import NeuroSwiftLM
+    from .tokenizer import WordTokenizer
+    from .benchmark import NeuroSwiftBenchmark
+    from .layers import auto_device
+
+    device = torch.device(args.device) if args.device else auto_device()
+    print(f"Loading model from {args.model} for benchmarking...")
+    
+    model = NeuroSwiftLM.from_pretrained(args.model, device=device)
+    tokenizer = WordTokenizer.from_pretrained(args.model)
+    
+    bench = NeuroSwiftBenchmark(model, tokenizer)
+    
+    test_data = None
+    if args.test_data:
+        test_data = json.loads(Path(args.test_data).read_text())
+        
+    bench.run_all(test_data=test_data)
+
+
+def _add_benchmark_parser(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("benchmark", help="Run performance and accuracy benchmarks")
+    p.add_argument("--model", type=Path, default=Path("artifacts/neuroswift-tiny"))
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--test-data", type=Path, default=None, help="JSON file with list of {'prompt': '...', 'response': '...'}")
+    p.set_defaults(func=_cmd_benchmark)
+
+
+# ---------------------------------------------------------------------------
 # Root parser
 # ---------------------------------------------------------------------------
 
@@ -487,6 +523,7 @@ Examples:
     _add_index_parser(sub)
     _add_generate_parser(sub)
     _add_auto_train_parser(sub)
+    _add_benchmark_parser(sub)
     return parser
 
 

@@ -40,8 +40,10 @@ from typing import Any
 
 import torch
 
-from neuroswift.data_pipeline import run_pipeline
+from neuroswift.data_pipeline import run_pipeline, WebScraper
 from neuroswift.layers import auto_device
+from neuroswift.rag import FuturePredictor, NeuroSwiftRAG
+from neuroswift.benchmark import NeuroSwiftBenchmark
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,6 +143,10 @@ Examples:
                           help="Max examples to evaluate from --eval-file.")
     mode_grp.add_argument("--show-plasticity", action="store_true", default=True,
                           help="Show plasticity logit shift and state norm.")
+    mode_grp.add_argument("--web-search", action="store_true",
+                          help="Enable live web-search (DuckDuckGo) fallback for RAG.")
+    mode_grp.add_argument("--benchmark", action="store_true",
+                          help="Run NeuroSwiftBenchmark on the loaded model and exit.")
     return p
 
 
@@ -373,6 +379,14 @@ def main() -> None:
         n = index_data_for_rag(assistant, data_source)
         logger.info(f"Indexed {n} samples into RAG.")
 
+    # ── Benchmarking ───────────────────────────────────────────────────────
+    if args.benchmark:
+        from neuroswift.benchmark import NeuroSwiftBenchmark
+        logger.info("Running God-Level Benchmark …")
+        bench = NeuroSwiftBenchmark(model, tokenizer)
+        bench.run_all()
+        return
+
     # Also index README + docs
     if assistant is not None:
         for extra in [Path("README.md"), Path("docs")]:
@@ -428,11 +442,26 @@ def main() -> None:
 
     # ── Default prompt or interactive mode ────────────────────────────────
     prompt = args.prompt or ("what is neuroswift?" if not args.interactive else None)
+    
+    # God-level temporal context
+    time_context = FuturePredictor.get_context()
 
     def _answer_one(user_prompt: str) -> None:
+        # Inject time context into assistant if available
+        final_prompt = f"{time_context}\n\nQuestion: {user_prompt}"
+        
         if assistant is not None:
+            # Use web search if requested
+            if args.web_search:
+                logger.info("Web-Search RAG enabled.")
+                web_hits = assistant.rag.web_query(user_prompt)
+                if web_hits:
+                    # Injected manually into prompt for now
+                    web_text = assistant.rag.format_hits(web_hits)
+                    final_prompt = f"Web Search Context:\n{web_text}\n\n{final_prompt}"
+
             result = assistant.answer(
-                user_prompt,
+                final_prompt,
                 retrieve_k=args.retrieve_k,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,

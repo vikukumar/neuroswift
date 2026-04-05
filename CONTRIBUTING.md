@@ -1,68 +1,47 @@
-# Contributing
+# Contributing to NeuroSwift
 
-Thank you for your interest in improving NeuroSwift.
+Welcome to the NeuroSwift community! We are building the most powerful and efficient CPU-first deep learning architecture in the world. Whether you are an AI researcher, a data scientist, or an MLOps engineer, your contributions are invaluable.
 
-This project was created by Vikash Kumar and welcomes thoughtful contributions that keep the codebase clear, fast, and easy to experiment with.
+---
 
-## Ways To Contribute
+## 🌟 How You Can Help
 
-- improve model quality or training stability
-- optimize CPU inference performance
-- improve documentation and examples
-- add tests, benchmarks, or reproducible experiments
-- report bugs and propose fixes
+- **Architecture Research**: Propose new linear token mixing layers or improved gating for Sparse MoE.
+- **Data Science**: Add new schema mappers for specialized domain data (e.g., medical, financial).
+- **Performance Tuning**: Add new optimizations for specific CPU instruction sets (AVX-512, AMX).
+- **Ecosystem**: Build new examples or integrate with other tools (e.g., LangChain, Hugging Face).
 
-## Development Setup
+## 🚀 Getting Started
 
-### Windows
+1. **Fork and Clone**:
+   ```bash
+   git clone https://github.com/your-username/neuroswift.git
+   cd neuroswift
+   ```
+2. **Environment Setup**:
+   ```bash
+   setup_env.bat  # Windows
+   # or
+   bash setup_env.sh # Linux/macOS
+   ```
+3. **Run Benchmarks**:
+   Ensure your environment is performant:
+   ```bash
+   python -m neuroswift benchmark
+   ```
 
-```bat
-setup_env.bat
-venv\Scripts\activate.bat
-```
+## 🛠 Development Guidelines
 
-### Linux / macOS
+- **Code Style**: We use `black` for formatting and `isort` for import sorting.
+- **Testing**: Add unit tests in `tests/` for any new layer or logic.
+- **Documentation**: If you add a feature, update the `README.md` and `docs/`.
 
-```bash
-bash setup_env.sh
-source venv/bin/activate
-```
+## 🧪 Submission Process
 
-## Recommended Workflow
+1. Create a descriptive branch: `git checkout -b feat/ultra-fast-scan`.
+2. Commit your changes with clear messages.
+3. Push and open a **Pull Request**.
+4. Our "God-Level" maintainers will review and merge!
 
-1. Create a feature branch.
-2. Make focused changes.
-3. Run local checks before opening a pull request.
-4. Include a short explanation of the problem and the solution.
-
-## Local Checks
-
-```bash
-python -m py_compile train_small_llm.py test_llm.py neuroswift/__init__.py neuroswift/layers.py neuroswift/plasticity.py neuroswift/model.py
-```
-
-If dependencies are installed, also run:
-
-```bash
-python train_small_llm.py
-python test_llm.py
-```
-
-## Pull Request Guidelines
-
-- keep pull requests scoped to one logical change
-- explain any architecture tradeoffs
-- avoid unrelated formatting-only edits
-- update documentation when behavior changes
-- include benchmark notes for performance-related changes
-
-## Code Style
-
-- prefer readable Python over clever Python
-- keep CPU efficiency in mind when changing model internals
-- document tensor shapes when logic is non-obvious
-- preserve small, reproducible scripts
-
-## Questions
-
-If something is unclear, open an issue or draft pull request with context and expected behavior.
+---
+**Thank you for helping us define the future of intelligence!**

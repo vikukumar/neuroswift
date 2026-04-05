@@ -670,9 +670,12 @@ def deduplicate(
         marks = [_get_marks(p) for p in pairs]
 
     seen_exact = set()
-    simhashes = []
+    buckets: dict[tuple[int, int], list[int]] = {}  # (band_idx, band_val) -> [simhash]
     unique = []
     removed = 0
+
+    BANDS = 4
+    BITS_PER_BAND = 16
 
     for pair, (key, sh) in zip(pairs, marks):
         if exact and key in seen_exact:
@@ -681,11 +684,29 @@ def deduplicate(
         seen_exact.add(key)
 
         if near_dup:
-            is_near = any(_hamming(sh, other) <= near_threshold for other in simhashes)
+            is_near = False
+            # LSH Bucketing Check (Locality Sensitive Hashing)
+            # Only check candidates that share at least one 16-bit band
+            candidates = set()
+            for band_idx in range(BANDS):
+                band_val = (sh >> (band_idx * BITS_PER_BAND)) & 0xFFFF
+                candidates.update(buckets.get((band_idx, band_val), []))
+            
+            for other_sh in candidates:
+                if _hamming(sh, other_sh) <= near_threshold:
+                    is_near = True
+                    break
+            
             if is_near:
                 removed += 1
                 continue
-            simhashes.append(sh)
+            
+            # Store simhash in buckets for future checks
+            for band_idx in range(BANDS):
+                band_val = (sh >> (band_idx * BITS_PER_BAND)) & 0xFFFF
+                if (band_idx, band_val) not in buckets:
+                    buckets[(band_idx, band_val)] = []
+                buckets[(band_idx, band_val)].append(sh)
 
         unique.append(pair)
 

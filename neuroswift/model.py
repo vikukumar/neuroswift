@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 from safetensors.torch import load_model as load_safetensors_model
 from safetensors.torch import save_model as save_safetensors_model
@@ -177,9 +180,7 @@ class NeuroSwiftLM(nn.Module):
             update_plasticity = not self.training
 
         device = input_ids.device
-        # Auto-set CPU threads for best single-process throughput
-        if device.type == "cpu":
-            torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+        # Note: Thread management is handled once at process initialization for Absolute Speed.
 
         x = self.token_embedding(input_ids)
         x = self.dropout(x)
@@ -422,16 +423,29 @@ class NeuroSwiftLM(nn.Module):
     def compile(self, backend: str = "inductor", mode: str = "reduce-overhead") -> nn.Module:
         """
         God-level optimization: torch.compile fusion.
-        Requires Torch 2.0+ and a compatible toolchain.
+        Requires Torch 2.0+ and a compatible toolchain (e.g., 'cl' on Windows, 'gcc' on Linux).
         """
         if not hasattr(torch, "compile"):
-            logger.warning("torch.compile not available in this version of Torch.")
+            logger.warning("torch.compile not available in this version of Torch. Falling back to eager.")
             return self
+            
+        # Windows-specific pre-flight for Inductor (requires MSVC cl.exe)
+        if os.name == "nt" and backend == "inductor":
+            import shutil
+            if not shutil.which("cl"):
+                logger.warning("[NeuroSwift] 'cl.exe' (MSVC) not found in PATH. Falling back to 'aot_eager' for Windows stability.")
+                backend = "aot_eager"
+
         try:
-            logger.info(f"Compiling model (backend={backend}) …")
-            return torch.compile(self, backend=backend, mode=mode)
+            logger.info(f"Initializing 'Absolute Performance' Engine (backend={backend}) …")
+            # Only pass 'mode' if backend is inductor (unsupported by aot_eager)
+            compile_kwargs = {"backend": backend}
+            if backend == "inductor":
+                compile_kwargs["mode"] = mode
+                
+            return torch.compile(self, **compile_kwargs)
         except Exception as e:
-            logger.warning(f"Compilation failed: {e}. Falling back to eager.")
+            logger.warning(f"Compilation failed during initialization: {e}. Falling back to eager.")
             return self
 
     def save_partial(self, directory: str | Path, step: int, loss: float) -> None:

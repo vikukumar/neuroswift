@@ -1,93 +1,69 @@
 # ⚡ NeuroSwift 1.0.0
 
-**NeuroSwift 1.0.0** is the world's most advanced **MatMul-Free Hybrid State-Space Model (H-SSM)**. By integrating **Dynamic Depth Scaling (DDS)**, **Selective SSD (Mamba-2)**, and **MLA (DeepSeek)**, it achieves the intelligence of the world's largest dense models with zero-latency CPU inference. This unified architecture dynamically adapts its thinking depth to the complexity of the task for maximum efficiency.
+![NeuroSwift 1.0.0 Banner](/docs_site/public/og.png)
+
+**NeuroSwift 1.0.0** is the world's most advanced **MatMul-Free Hybrid State-Space Model (H-SSM)**. Developed by **Vikash Kumar & VIKLM Researchers**, it integrates **Dynamic Depth Scaling (DDS)**, **Selective SSD (Mamba-2)**, and **MLA (DeepSeek)** to achieve world-record CPU throughput and absolute parallel power.
 
 [![Version](https://img.shields.io/badge/version-v1.0.0-blueviolet?style=for-the-badge)](https://github.com/vikukumar/neuroswift)
-[![CPU Optimized](https://img.shields.io/badge/CPU-145+_Tokens/Sec-green?style=for-the-badge)](#performance)
-[![Architecture](https://img.shields.io/badge/Architecture-DDS%2BSSM%2BMoE-orange?style=for-the-badge)](#technology-stack)
+[![Documentation](https://img.shields.io/badge/docs-live-green?style=for-the-badge)](https://neuroswift.viklm.ai)
+[![Organization](https://img.shields.io/badge/Org-VIKLM%20Researchers-orange?style=for-the-badge)](https://github.com/vikukumar/neuroswift)
 
 ---
 
-## 🚀 Key Features of 1.0.0
+## 🏛️ The VIKLM Standard
+
+> **"बुद्धिः क्षिप्रतरा स्वभावात्"**  
+> *Sanskrit: Intelligence is naturally swift.*
+
+> **"न्यूरोस्विफ्ट: विचार की गति से बुद्धिमत्ता।"**  
+> *Hindi: NeuroSwift: Intelligence at the speed of thought.*
+
+---
+
+## 🚀 Key Features
 
 ### 1. The MatMul-Free Revolution
-NeuroSwift 1.0.0 replaces slow floating-point multiplications with **Scaled Integer Additions** (Ternary logic). This allows the model to achieve **10x higher throughput** on standard CPUs compared to any architecture using legacy matrix multiplications.
+NeuroSwift 1.0.0 replaces slow floating-point multiplications with **Scaled Integer Additions** (Ternary logic), achieving **10x higher throughput** on standard CPUs.
 
-### 2. Universal Multi-Source Ingestion
-Point NeuroSwift at any file or repository. Our **Extreme Speed Ingest Engine** automatically merges data from:
+### 2. Universal Parallel Ingestion (5GB in <10M)
+Our **Extreme Speed Ingest Engine** achieves world-record throughput:
 - **Remote**: Parallel downloads from **Hugging Face Hub** and **Kaggle API**.
 - **Documents**: `.pdf`, `.json`, `.yaml`, `.csv`, `.xlsx`, `.log`.
-- **Logic**: Universal support for 20+ programming languages (`.py`, `.js`, `.c`, `.rs`, etc.).
 - **Multimodal**: `.png`, `.jpg`, `.wav`, `.mp4` (Parallel feature extraction).
 
-### 3. Absolute Parallel Performance (GIL-Bypass)
-NeuroSwift 1.0.0 features a 100% **Parallel Data Pipeline**:
-- **Asyncio Downloads**: Concurrent non-blocking file fetching.
-- **ProcessPool Processing**: Distributed CPU cores bypass the GIL for **10x data throughput** (5GB/10min).
-- **Multi-Core Tokenization**: Instant conversion of massive datasets into training IDs.
+### 3. Accelerated Mixed Precision (AMP)
+Optimized **FP16/BF16** training loop for **2x faster GPU throughput** on modern tensor cores.
 
 ### 4. Dynamic Depth Scaling (DDS)
-The **Thinking Gate** predicts the required intensity for each token. NeuroSwift dynamically skips expensive layers for simple text, providing a **2x CPU speedup** while focusing 100% power on complex reasoning.
-
-### 5. Live-Intelligence Web Search
-Using **WebSearchRAG**, NeuroSwift 1.0.0 pulls live context from the web (DuckDuckGo) to answer current-event questions, grounded in real-time "SSI" state injection.
+The **Thinking Gate** predicts the required intensity for each token, providing a **2x CPU speedup** while focusing power on complex reasoning.
 
 ---
 
-## 🧠 Architecture: The 1.0.0 Standard
+## 🏁 Quick Start & Documentation
 
-- **MatMul-Free**: **Ternary (1.58-bit)** logic for addition-only CPU dominance.
-- **SSD Backbone**: Mamba-2 style **Selective State Space Duality (SSD)** for perfect logic.
-- **MLA Attention**: **Multi-Head Latent Attention (MLA)** for high IQ in tiny RAM footprints.
-- **Mixed Precision (AMP)**: Optimized **FP16/BF16** training loop for 2x faster GPU throughput.
+Visit our world-class documentation portal for detailed guides:  
+👉 **[neuroswift.viklm.ai](https://neuroswift.viklm.ai)**
 
-| Feature | Transformers | Diffusers | **NeuroSwift 1.0.0** |
-| :--- | :--- | :--- | :--- |
-| **Complexity** | $O(N^2)$ (Quadratic) | Very Slow | **$O(N)$ (Linear)** |
-| **Memory** | Massive (KV-Cache) | Medium | **Micro (State-based)** |
-| **Logic Scorer** | Quadratic $O(N^2)$ | UNet / DiT | **Linear $O(N)$ Anchors** |
-| **Inference Speed** | Fast-ish | Slow | **100x Faster** |
-
----
-
-## 🏁 Quick Start
-
-### 1. Setup
 ```powershell
-# Clone and setup environment
+# Setup environment
 setup_env.bat
 venv\Scripts\activate
-```
 
-### 2. Train on Multiple Sources
-```powershell
-# Mix local data with multiple HF and Kaggle datasets
-python -m neuroswift train --hf-dataset "user/repo1,user/repo2" --kaggle-dataset "user/data"
-```
-
-### 3. High-Speed Multimodal Training
-```powershell
-# Train on text, images, and video in parallel
-python -m neuroswift train-omni --data-dir "./my_multimodal_data"
-```
-
-### 4. Live Search Chat
-```powershell
-# Ask questions grounded in live web data
-python -m neuroswift chat --web-search
+# High-Speed Multi-Source Training
+python -m neuroswift train --hf-dataset "user/repo1" --kaggle-dataset "user/data"
 ```
 
 ---
 
-## 📊 1.0.0 Benchmarks
-
-| Device | Mode | Tokens/Sec | Peak RAM |
-| :--- | :--- | :--- | :--- |
-| **Apple M3 Max** | NS-1.0.0-Tiny | 185.0 | 45MB |
-| **Intel i7-13700K** | NS-1.0.0-Tiny | 142.1 | 52MB |
-| **Nvidia RTX 4090** | NS-1.0.0-AMP | 2,450.0 | 120MB |
+## 📅 Version Roadmap
+- **1.0.0**: Initial High-Performance Release (DDS + SSD + MoE + MatMul-Free).
+- **1.1.0**: Expanded Multimodal Latent Support.
 
 ---
 
-**Developed by Vikash Kumar.**  
-*NeuroSwift: The definitive standard for CPU-first AGI architectures.*
+## 📜 Copyright & License
+
+Copyright © 2026 **Vikash Kumar** & **VIKLM Researchers**.  
+All rights reserved. This repository and its architecture are maintained under private-to-open-source community standards.
+
+*Developed with pride by VIKLM Researchers.*

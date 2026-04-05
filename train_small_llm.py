@@ -353,7 +353,8 @@ def main() -> None:
         device = auto_device()
 
     if device.type == "cpu":
-        torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
+        # Uncap threads for Absolute CPU Performance (1.0.0 Standard)
+        torch.set_num_threads(os.cpu_count() or 1)
 
     # Batch size auto
     batch_size = args.batch_size
@@ -440,6 +441,8 @@ def main() -> None:
             MmapDataset.from_pairs(train_pairs, tokenizer, mmap_path, seq_len=args.seq_len),
             batch_size=batch_size,
             shuffle=False, 
+            num_workers=min(4, os.cpu_count() or 1),
+            persistent_workers=True if (os.cpu_count() or 1) >= 4 else False,
         )
         train_inputs = train_pairs # marker for auto_model_size
     else:
@@ -524,9 +527,11 @@ def main() -> None:
         )
         model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
 
-    # Optional torch.compile (God-level optimized)
-    if args.compile:
-        model = model.compile()
+    # ── Extreme CPU Speed: Unified Compilation (Absolute Performance 1.0.0) ──
+    if args.compile or (device.type == "cpu" and hasattr(torch, "compile")):
+        logger.info("Initializing 'Absolute Performance' Compilation (torch.compile)...")
+        # Mode 'reduce-overhead' is ideal for NeuroSwift's hybrid SSM/Attention graph
+        model = model.compile(mode="reduce-overhead")
 
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params:,}")
@@ -577,12 +582,18 @@ def main() -> None:
             batch_lbl = batch_lbl.to(device)
 
             if scaler is not None:
-                # Use bf16 if available (more stable for SSMs)
+                # GPU AMP
                 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     out = model(batch_inp, targets=batch_lbl, update_plasticity=False)
                     loss = out["loss"] / args.grad_accum
                 scaler.scale(loss).backward()
+            elif device.type == "cpu":
+                # Extreme CPU Speed: BFloat16 AMP (AMX/AVX-512)
+                with torch.amp.autocast("cpu", enabled=True, dtype=torch.bfloat16):
+                    out = model(batch_inp, targets=batch_lbl, update_plasticity=False)
+                    loss = out["loss"] / args.grad_accum
+                loss.backward()
             else:
                 out = model(batch_inp, targets=batch_lbl, update_plasticity=False)
                 loss = out["loss"] / args.grad_accum

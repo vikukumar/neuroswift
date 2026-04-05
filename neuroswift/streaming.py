@@ -51,11 +51,16 @@ class MmapDataset(IterableDataset):
             
         filesize = os.path.getsize(mmap_path)
         self.total_tokens = filesize // np.dtype(dtype).itemsize
-        self.num_samples = self.total_tokens // seq_len
+        # One extra token for shifted targets
+        self.num_samples = (self.total_tokens - 1) // seq_len
         
         logger.info(f"Loaded MmapDataset: {self.num_samples:,} samples ({self.total_tokens:,} tokens)")
 
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+    def __len__(self) -> int:
+        """Returns the total number of samples in the memmap dataset."""
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         data = np.memmap(self.mmap_path, dtype=self.dtype, mode="r")
         worker_info = torch.utils.data.get_worker_info()
         
@@ -67,16 +72,15 @@ class MmapDataset(IterableDataset):
 
         for i in iter_range:
             start = i * self.seq_len
-            end = start + self.seq_len
+            end = start + self.seq_len + 1
             chunk = data[start:end].astype(np.int64)
             
-            if len(chunk) < self.seq_len:
+            if len(chunk) < self.seq_len + 1:
                 continue
                 
-            input_ids = torch.from_numpy(chunk)
-            yield {
-                "input_ids": input_ids,
-            }
+            input_ids = torch.from_numpy(chunk[:-1])
+            labels = torch.from_numpy(chunk[1:])
+            yield input_ids, labels
 
     @classmethod
     def from_pairs(
@@ -105,11 +109,13 @@ class MmapDataset(IterableDataset):
             for pair in pairs:
                 all_tokens.extend(_tokenize_worker_mmap((pair, tokenizer)))
             
-        # Pad to multiple of seq_len
+        # Pad to (num_samples * seq_len) + 1 for shifted targets
         pad_id = tokenizer.stoi[tokenizer.pad_token]
-        rem = len(all_tokens) % seq_len
-        if rem > 0:
-            all_tokens.extend([pad_id] * (seq_len - rem))
+        n_samples = int(np.ceil(len(all_tokens) / seq_len))
+        target_len = (n_samples * seq_len) + 1
+        
+        if len(all_tokens) < target_len:
+            all_tokens.extend([pad_id] * (target_len - len(all_tokens)))
             
         # High-speed disk dump
         logger.info(f"Writing {len(all_tokens):,} tokens to {mmap_path} ...")

@@ -163,6 +163,53 @@ class NeuroSwiftLM(nn.Module):
 
         return out
 
+    @staticmethod
+    def _apply_repetition_penalty(logits: Tensor, generated: Tensor, penalty: float) -> Tensor:
+        if penalty <= 1.0 or generated.numel() == 0:
+            return logits
+
+        adjusted = logits.clone()
+        for batch_idx in range(generated.size(0)):
+            token_ids = torch.unique(generated[batch_idx])
+            batch_logits = adjusted[batch_idx, token_ids]
+            adjusted[batch_idx, token_ids] = torch.where(
+                batch_logits < 0,
+                batch_logits * penalty,
+                batch_logits / penalty,
+            )
+        return adjusted
+
+    @staticmethod
+    def _sample_from_logits(
+        logits: Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> Tensor:
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        filtered = logits / max(temperature, 1e-5)
+
+        if top_k > 0 and top_k < filtered.size(-1):
+            top_values, _ = torch.topk(filtered, top_k, dim=-1)
+            kth = top_values[:, -1].unsqueeze(-1)
+            filtered = torch.where(filtered < kth, torch.full_like(filtered, float("-inf")), filtered)
+
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove_mask = cumulative > top_p
+            remove_mask[:, 1:] = remove_mask[:, :-1].clone()
+            remove_mask[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+            filtered = torch.full_like(filtered, float("-inf"))
+            filtered.scatter_(1, sorted_indices, sorted_logits)
+
+        probs = torch.softmax(filtered, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
     @torch.no_grad()
     def generate(
         self,
@@ -170,9 +217,12 @@ class NeuroSwiftLM(nn.Module):
         max_new_tokens: int = 40,
         temperature: float = 1.0,
         eos_token_id: Optional[int] = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        adapt_during_generation: bool = False,
     ) -> Tensor:
         self.eval()
-        temperature = max(temperature, 1e-5)
 
         outputs = self(
             input_ids,
@@ -185,9 +235,14 @@ class NeuroSwiftLM(nn.Module):
         generated = input_ids
 
         for _ in range(max_new_tokens):
-            logits = outputs["logits"][:, -1] / temperature
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            logits = outputs["logits"][:, -1]
+            logits = self._apply_repetition_penalty(logits, generated, repetition_penalty)
+            next_token = self._sample_from_logits(
+                logits=logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
 
             if eos_token_id is not None and torch.all(next_token == eos_token_id):
                 break
@@ -197,7 +252,7 @@ class NeuroSwiftLM(nn.Module):
                 next_token,
                 ssm_states=ssm_states,
                 plastic_states=plastic_states,
-                update_plasticity=True,
+                update_plasticity=adapt_during_generation,
             )
             ssm_states = outputs["ssm_states"]
             plastic_states = outputs["plastic_states"]
@@ -239,4 +294,4 @@ class NeuroSwiftLM(nn.Module):
         return model
 
 
-__all__ = ["NeuroSwiftConfig", "NeuroSwiftLM"]
+__all__ = ["NeuroSwiftBlock", "NeuroSwiftConfig", "NeuroSwiftLM"]

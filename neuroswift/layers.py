@@ -165,6 +165,8 @@ class SparseMoE(nn.Module):
 
         self.norm = RMSNorm(d_model)
         self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.context_router = nn.Linear(d_model, num_experts, bias=False)
+        self.context_gate = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.experts = nn.ModuleList(
             [ExpertMLP(d_model, aligned_hidden, dropout=dropout) for _ in range(num_experts)]
@@ -174,8 +176,16 @@ class SparseMoE(nn.Module):
         residual = x
         batch, seq_len, d_model = x.shape
 
-        tokens = self.norm(x).reshape(batch * seq_len, d_model)
-        router_logits = self.router(tokens)
+        normalized = self.norm(x)
+        prefix_steps = torch.arange(1, seq_len + 1, device=x.device, dtype=x.dtype).view(1, seq_len, 1)
+        prefix_summary = normalized.cumsum(dim=1) / prefix_steps
+        conditioned = normalized * torch.sigmoid(self.context_gate(prefix_summary))
+
+        tokens = conditioned.reshape(batch * seq_len, d_model)
+        router_logits = self.router(tokens) + self.context_router(prefix_summary).reshape(
+            batch * seq_len,
+            self.num_experts,
+        )
         router_probs = torch.softmax(router_logits, dim=-1)
 
         top_weights, top_indices = torch.topk(router_probs, k=self.top_k, dim=-1)

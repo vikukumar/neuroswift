@@ -730,8 +730,12 @@ def main() -> None:
 
     # Solo optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     
-    total_steps = len(train_loader) * args.epochs
+    # Absolute Speed Profile: m_size aggregation for GPU RAM saturation
+    m_size = 8
+    
+    total_steps = (len(train_loader) // m_size) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     global_step = 0
     best_val_loss = float("inf")
@@ -747,50 +751,65 @@ def main() -> None:
         prefetcher.wait_for_warmup()
         
         step_start_time = time.time()
-        for batch_idx, (batch_inp, batch_lbl) in enumerate(prefetcher):
-            batch_inp, batch_lbl = batch_inp.to(device), batch_lbl.to(device)
+        mb_inp, mb_lbl = [], []
+        
+        for batch_idx, (inp, lbl) in enumerate(prefetcher):
+            mb_inp.append(inp)
+            mb_lbl.append(lbl)
+            if len(mb_inp) < m_size:
+                continue
+            
+            # Fused Micro-batch Processing: Saturates GPU TensorCores
+            batch_inp = torch.cat(mb_inp, dim=0).to(device)
+            batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
+            mb_inp, mb_lbl = [], []
             
             optimizer.zero_grad(set_to_none=True)
             
-            # Warp Engine v18: Inductor Fallback (fixes GPU-Inductor crashes in v2.4/2.5)
-            try:
-                out = model(batch_inp, targets=batch_lbl)
-            except Exception as e:
-                # Catch specific Inductor/Triton/Scan errors that occur in v2.4/v2.5
-                if "Inductor" in str(e) or "Triton" in str(e) or "list indices" in str(e):
-                    logger.warning(f"  [NeuroSwift] Inductor Crash detected: {e}. Falling back to Eager-Mode for stability.")
-                    # Re-trying without compile (calling base model)
-                    if hasattr(model, "_orig_mod"):
-                        model = model._orig_mod
+            # Mixed Precision Context
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                # Warp Engine v18: Inductor Fallback
+                try:
                     out = model(batch_inp, targets=batch_lbl)
-                else:
-                    raise e
+                except Exception as e:
+                    if "Inductor" in str(e) or "Triton" in str(e) or "list indices" in str(e):
+                        logger.warning(f"  [NeuroSwift] Inductor Crash: {e}. Falling back to Eager-Mode.")
+                        if hasattr(model, "_orig_mod"):
+                            model = model._orig_mod
+                        out = model(batch_inp, targets=batch_lbl)
+                    else:
+                        raise e
+                
+                loss = out["loss"]
             
-            loss = out["loss"]
+            # Stability Guard: Skip NaN / Inf gradients
+            if not torch.isfinite(loss):
+                logger.warning(f"  [NaN Guard] Loss is {loss.item()}. Skipping update to protect weights.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
             
-            # Loss spike detection & stabilization
+            # Loss reporting & stabilization
             current_loss_val = loss.item()
             if ema_loss is None:
                 ema_loss = current_loss_val
             else:
-                if current_loss_val > 1.5 * ema_loss and current_loss_val > 0.5:
-                    for pg in optimizer.param_groups:
-                        pg["lr"] *= 0.5
                 ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
             global_step += 1
             n_steps += 1
-            epoch_loss += loss.item()
+            epoch_loss += current_loss_val
 
             if n_steps % 50 == 0:
                 elapsed = time.time() - step_start_time
                 steps_per_sec = 50 / max(elapsed, 0.001)
-                samples_per_sec = (50 * batch_size) / max(elapsed, 0.001)
-                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{len(train_loader)} | Speed: {steps_per_sec:.1f} steps/s | {samples_per_sec:.1f} smp/s | Loss: {loss.item():.4f}")
+                samples_per_sec = (50 * m_size * batch_size) / max(elapsed, 0.001)
+                logger.info(f"  [Epoch {epoch}] Step {n_steps} | Updates: {steps_per_sec:.1f} steps/s | Aggregate: {samples_per_sec:.1f} smp/s | Loss: {ema_loss:.4f}")
                 step_start_time = time.time()
 
         prefetcher.stop_event.set()

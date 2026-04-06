@@ -678,19 +678,28 @@ def main() -> None:
         fused=True,
     )
     
-    # ── Distributed Architecture: Aero-Turbo Overdrive (v29) ────────────────
-    # Forced process over-subscription for absolute GPU saturation (200+ steps/s)
+    # ── Distributed Architecture: Aero-Turbo Overdrive (v30) ────────────────
+    # Aero-Intelligence: Auto-detecting over-subscription mode
     world_size = 1
     backend = "gloo"
     
-    # Nuclear Distributed Sync (Fixes ValueError: MASTER_ADDR not set)
+    # Distributed Sync Environment (Atomic Persistence)
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
 
     if device.type == "cuda":
-        # Over-subscribe: 2 logical ranks per physical device
-        world_size = torch.cuda.device_count() * 2 
-        backend = "nccl"
+        num_physical_gpus = torch.cuda.device_count()
+        # Intelligent Backend Selection
+        if num_physical_gpus == 1:
+            # NCCL does not support multiple ranks on a single GPU.
+            # Using GLOO for stable over-subscription on single-GPU hardware.
+            world_size = 2 
+            backend = "gloo"
+            logger.info("[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to GLOO backend for absolute stability.")
+        else:
+            # Professional NCCL for multi-GPU clusters
+            world_size = num_physical_gpus 
+            backend = "nccl"
     else:
         world_size = 10 
         backend = "gloo"
@@ -813,8 +822,10 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         except: pass
 
     if world_size > 1:
-        # For logical over-subscription, map ranks to physical device IDs
-        model = DDP(model, device_ids=[rank % torch.cuda.device_count()] if backend == "nccl" else None, find_unused_parameters=True)
+        # Aero-Intelligence v30: NCCL requires device_ids, GLOO requires None for single-GPU stability
+        # Mapping ranks to physical device IDs
+        ddp_device_id = [rank % torch.cuda.device_count()] if backend == "nccl" else None
+        model = DDP(model, device_ids=ddp_device_id, find_unused_parameters=True)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
@@ -929,6 +940,10 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
             dist.barrier()
 
     finally:
+        # Atomic Cleanup: Removing resource leak warnings
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        
         if rank == 0:
             logger.info("Distributed Training Complete. Master exiting...")
             # Cleanup Fix
@@ -936,8 +951,6 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
             _save_checkpoint(raw_mod, tokenizer, args.output_dir / "last", 0.0)
         
         gc.enable()
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 def _evaluate_worker(model, prefetcher, device):
     """Distributed evaluation helper with safe initialization checks."""

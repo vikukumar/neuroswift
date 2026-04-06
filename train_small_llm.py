@@ -685,156 +685,38 @@ def main() -> None:
     
     # --- Super-Saturation v18: Hyper-Scaling Process Launch ---
     world_size = 10 if device.type == "cpu" else 1
-    if device.type == "cpu":
-        # Set Master Address for Distributed Backend
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        
-        # Explicit GC to clear RAM for 10 workers
-        gc.collect()
-        
-        # Shared Memory Model (Tokenizer passed via spawn pickling)
-        model.share_memory()
-        
-        logger.info(f"Master: Launching {world_size} distributed processes...")
-        try:
-            mp.spawn(
-                train_worker,
-                args=(world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args),
-                nprocs=world_size,
-                join=True
-            )
-        except Exception as e:
-            logger.error(f"Distributed Launch Failed: {e}. Falling back to Solo-Turbo.")
-            raise e
-        return
-
-    # ── Single-Device Training Loop (GPU / MPS / Solo-CPU) ───────────────────
-    logger.info(f"Master: Launching Solo-Turbo Engine on {device}...")
+    # --- Absolute Speed V18: Multi-Process Distributed Engine ---
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
     
-    # Dataset Sharding (Identity for single device)
-    train_dataset = TensorDataset(train_inputs, train_labels)
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=0, 
-        pin_memory=True if device.type == "cuda" else False,
-    )
+    # Explicit GPU/CPU Detection for World Size
+    if device.type == "cuda":
+        world_size = torch.cuda.device_count()
+        backend = "nccl"
+        logger.info(f"Master: Launching {world_size} CUDA Processes (NCCL)...")
+    else:
+        world_size = 10 # 10-core optimized CPU scaling
+        backend = "gloo"
+        logger.info(f"Master: Launching {world_size} CPU Processes (GLOO)...")
+
+    # Explicit GC to clear RAM for workers
+    gc.collect()
     
-    val_loader = None
-    if has_val:
-        v_inputs, v_labels, _ = build_sft_tensors(val_pairs, tokenizer, seq_len=args.seq_len)
-        val_dataset = TensorDataset(v_inputs, v_labels)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size * 2, shuffle=False, num_workers=0)
-
-    # Solo optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    # Shared Memory Model (Tokenizer passed via spawn)
+    model.share_memory()
     
-    # Absolute Speed Profile: m_size aggregation for GPU RAM saturation
-    m_size = 8
-    
-    total_steps = (len(train_loader) // m_size) * args.epochs
-    warmup_steps = int(total_steps * args.warmup_ratio)
-    global_step = 0
-    best_val_loss = float("inf")
-    ema_loss = None
+    try:
+        mp.spawn(
+            train_worker,
+            args=(world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args),
+            nprocs=world_size,
+            join=True
+        )
+    except Exception as e:
+        logger.error(f"Distributed Engine Failed: {e}")
+        raise e
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-        n_steps = 0
-        
-        # Parallel Prefetcher for GPU throughput
-        prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
-        prefetcher.wait_for_warmup()
-        
-        step_start_time = time.time()
-        mb_inp, mb_lbl = [], []
-        
-        for batch_idx, (inp, lbl) in enumerate(prefetcher):
-            mb_inp.append(inp)
-            mb_lbl.append(lbl)
-            if len(mb_inp) < m_size:
-                continue
-            
-            # Fused Micro-batch Processing: Saturates GPU TensorCores
-            batch_inp = torch.cat(mb_inp, dim=0).to(device)
-            batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
-            mb_inp, mb_lbl = [], []
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Mixed Precision Context
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                # Warp Engine v18: Inductor Fallback
-                try:
-                    out = model(batch_inp, targets=batch_lbl)
-                except Exception as e:
-                    if "Inductor" in str(e) or "Triton" in str(e) or "list indices" in str(e):
-                        logger.warning(f"  [NeuroSwift] Inductor Crash: {e}. Falling back to Eager-Mode.")
-                        if hasattr(model, "_orig_mod"):
-                            model = model._orig_mod
-                        out = model(batch_inp, targets=batch_lbl)
-                    else:
-                        raise e
-                
-                loss = out["loss"]
-            
-            # Stability Guard: Skip NaN / Inf gradients
-            if not torch.isfinite(loss):
-                logger.warning(f"  [NaN Guard] Loss is {loss.item()}. Skipping update to protect weights.")
-                optimizer.zero_grad(set_to_none=True)
-                continue
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # Loss reporting & stabilization
-            current_loss_val = loss.item()
-            if ema_loss is None:
-                ema_loss = current_loss_val
-            else:
-                ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
-
-            global_step += 1
-            n_steps += 1
-            epoch_loss += current_loss_val
-
-            if n_steps % 50 == 0:
-                elapsed = time.time() - step_start_time
-                steps_per_sec = 50 / max(elapsed, 0.001)
-                samples_per_sec = (50 * m_size * batch_size) / max(elapsed, 0.001)
-                logger.info(f"  [Epoch {epoch}] Step {n_steps} | Updates: {steps_per_sec:.1f} steps/s | Aggregate: {samples_per_sec:.1f} smp/s | Loss: {ema_loss:.4f}")
-                step_start_time = time.time()
-
-        prefetcher.stop_event.set()
-        
-        # Validation
-        if val_loader:
-            model.eval()
-            v_total, v_n = 0.0, 0
-            with torch.no_grad():
-                for v_i, v_l in val_loader:
-                    v_i, v_l = v_i.to(device), v_l.to(device)
-                    o = model(v_i)
-                    l = F.cross_entropy(o["logits"].view(-1, o["logits"].size(-1)), v_l.view(-1), ignore_index=-100)
-                    v_total += l.item()
-                    v_n += 1
-            v_loss = v_total / max(v_n, 1)
-            logger.info(f"Epoch {epoch:02d} Complete | Eval Loss: {v_loss:.4f}")
-            if v_loss < best_val_loss:
-                best_val_loss = v_loss
-                _save_checkpoint(model, tokenizer, args.output_dir, v_loss, is_best=True)
-        else:
-            _save_checkpoint(model, tokenizer, args.output_dir, 0.0)
-
-    logger.info("Solo-Training Complete.")
-    _save_checkpoint(model, tokenizer, args.output_dir / "last", 0.0)
+    logger.info("Training Run Complete.")
 
 class BackgroundPrefetcher:
     """Zero-Blocking Async Loader replacing PyTorch's native worker queue locks."""
@@ -875,64 +757,75 @@ class BackgroundPrefetcher:
     def __len__(self):
         return len(self.loader)
 
-def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args):
-    # Worker Startup ──────────────────────────────────────────────────────────
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
-    device = torch.device("cpu")
-    # Single-thread to eliminate core-hopping and L3 cache contention
-    torch.set_num_threads(1) 
+def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args):
+    # --- Absolute Worker Startup ---
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
     
-    # Hyper-Scaling: m_size=10 for massive SIMD aggregation
-    m_size = 10
+    if backend == "nccl":
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        # Using BF16/FP16 if GPU supports it
+        amp_enabled = True
+    else:
+        device = torch.device("cpu")
+        torch.set_num_threads(1)
+        amp_enabled = False
+    
+    # Performance Heuristics: m_size for batch aggregation
+    m_size = 10 if backend == "gloo" else 8
     
     # Dataset Sharding
     train_dataset = TensorDataset(train_inputs, train_labels)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     
-    # Using args.batch_size for SIMD efficiency
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         sampler=train_sampler, 
         num_workers=0, 
-        pin_memory=False,
+        pin_memory=(backend == "nccl"),
     )
     
-    # Validation Dataset
     val_loader = None
     if v_inputs is not None:
         val_dataset = TensorDataset(v_inputs, v_labels)
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0, pin_memory=False)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
 
-    # Re-build for Worker (DDP requires fresh wrap)
+    # Re-build Model for rank (DDP requires fresh wrap)
     d_model = args.d_model if args.d_model > 0 else 64
     config = NeuroSwiftConfig(
         vocab_size=tokenizer.vocab_size,
         d_model=d_model,
         n_layers=args.n_layers if args.n_layers > 0 else 2,
         d_state=4, expansion=2, conv_kernel=4, num_experts=args.num_experts,
-        top_k=2, expert_hidden=d_model*2, plastic_dim=16, ternary_mode=True,
+        top_k=2, expert_hidden=d_model*2, plastic_dim=16, ternary_mode=(backend == "gloo"),
     )
     model = NeuroSwiftLM(config).to(device)
-    # find_unused_parameters=False drastically speeds up DDP on CPU (approx 2-3x speedup)
-    model = DDP(model, find_unused_parameters=False)
+    
+    # Optional Compilation (Stability Fallback Integrated)
+    if args.compile:
+        try:
+            model = model.compile(mode="default")
+        except:
+            pass
+
+    model = DDP(model, device_ids=[rank] if backend == "nccl" else None, find_unused_parameters=False)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     
     steps_per_epoch = len(train_loader) // m_size
-    if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0:
-        steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch // m_size)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
-    # ── Multi-Process Training loop ──────────────────────────────────────────────
+    # ── Single Distributed loop ──────────────────────────────────────────────
     global_step = 0
     best_val_loss = float("inf")
     ema_loss = None
 
-    # Disable automatic GC to prevent erratic deep-training stutters
-    gc.disable()
+    if backend == "gloo":
+        gc.disable()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -940,25 +833,13 @@ def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_label
         epoch_loss = 0.0
         n_steps = 0
         
-        # Hyper-Optimization: Warming up the pipeline per-epoch to ensure fresh iteration
         prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
         prefetcher.wait_for_warmup()
         
-        # Reset Validation Prefetcher every epoch (fixes stall/exhaustion issue)
-        v_prefetcher = None
-        if val_loader:
-            v_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
-            v_prefetcher.wait_for_warmup()
-            
         step_start_time = time.time()
-        # Micro-batch aggregation buffers
         mb_inp, mb_lbl = [], []
         
         for batch_idx, (inp, lbl) in enumerate(prefetcher):
-            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
-                prefetcher.stop_event.set()
-                break
-                
             mb_inp.append(inp)
             mb_lbl.append(lbl)
             if len(mb_inp) < m_size:

@@ -1,6 +1,6 @@
 # ⚡ NeuroSwift 1.0.0 "Absolute Engine"
 
-![NeuroSwift Banner](./docs/NeuroSwift AI branding banner.png)
+![NeuroSwift Banner](docs/NeuroSwift_AI_banner.png)
 
 **NeuroSwift 1.0.0** marks the transition to the **"Absolute Engine"**—a world-class training architecture that achieves **100+ steps/sec** on 10-core mobile CPUs (Intel/AMD) while maintaining absolute architectural integrity.
 

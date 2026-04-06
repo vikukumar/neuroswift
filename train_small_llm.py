@@ -541,7 +541,8 @@ def main() -> None:
     logger.info("Tokenizing training pairs …")
     
     # Turbo Engine v4: Force RAM Mode for CPU to eliminate SSD latency
-    use_ssd = False if device.type == "cpu" else (args.use_ssd or (len(train_pairs) > 50000))
+    # Mode: RAM-Master (threshold increased to 1M to allow large datasets in GPU/High-RAM environments)
+    use_ssd = False if device.type == "cpu" else (args.use_ssd or (len(train_pairs) > 1_000_000))
     
     if use_ssd:
         mmap_path = args.output_dir / "train_cache.mmap"
@@ -707,6 +708,100 @@ def main() -> None:
             logger.error(f"Distributed Launch Failed: {e}. Falling back to Solo-Turbo.")
             raise e
         return
+
+    # ── Single-Device Training Loop (GPU / MPS / Solo-CPU) ───────────────────
+    logger.info(f"Master: Launching Solo-Turbo Engine on {device}...")
+    
+    # Dataset Sharding (Identity for single device)
+    train_dataset = TensorDataset(train_inputs, train_labels)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=0, 
+        pin_memory=True if device.type == "cuda" else False,
+    )
+    
+    val_loader = None
+    if has_val:
+        v_inputs, v_labels, _ = build_sft_tensors(val_pairs, tokenizer, seq_len=args.seq_len)
+        val_dataset = TensorDataset(v_inputs, v_labels)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size * 2, shuffle=False, num_workers=0)
+
+    # Solo optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    global_step = 0
+    best_val_loss = float("inf")
+    ema_loss = None
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        n_steps = 0
+        
+        # Parallel Prefetcher for GPU throughput
+        prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
+        prefetcher.wait_for_warmup()
+        
+        step_start_time = time.time()
+        for batch_idx, (batch_inp, batch_lbl) in enumerate(prefetcher):
+            batch_inp, batch_lbl = batch_inp.to(device), batch_lbl.to(device)
+            
+            optimizer.zero_grad(set_to_none=True)
+            out = model(batch_inp, targets=batch_lbl)
+            loss = out["loss"]
+            
+            # Loss spike detection & stabilization
+            current_loss_val = loss.item()
+            if ema_loss is None:
+                ema_loss = current_loss_val
+            else:
+                if current_loss_val > 1.5 * ema_loss and current_loss_val > 0.5:
+                    for pg in optimizer.param_groups:
+                        pg["lr"] *= 0.5
+                ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            global_step += 1
+            n_steps += 1
+            epoch_loss += loss.item()
+
+            if n_steps % 50 == 0:
+                elapsed = time.time() - step_start_time
+                steps_per_sec = 50 / max(elapsed, 0.001)
+                samples_per_sec = (50 * batch_size) / max(elapsed, 0.001)
+                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{len(train_loader)} | Speed: {steps_per_sec:.1f} steps/s | {samples_per_sec:.1f} smp/s | Loss: {loss.item():.4f}")
+                step_start_time = time.time()
+
+        prefetcher.stop_event.set()
+        
+        # Validation
+        if val_loader:
+            model.eval()
+            v_total, v_n = 0.0, 0
+            with torch.no_grad():
+                for v_i, v_l in val_loader:
+                    v_i, v_l = v_i.to(device), v_l.to(device)
+                    o = model(v_i)
+                    l = F.cross_entropy(o["logits"].view(-1, o["logits"].size(-1)), v_l.view(-1), ignore_index=-100)
+                    v_total += l.item()
+                    v_n += 1
+            v_loss = v_total / max(v_n, 1)
+            logger.info(f"Epoch {epoch:02d} Complete | Eval Loss: {v_loss:.4f}")
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                _save_checkpoint(model, tokenizer, args.output_dir, v_loss, is_best=True)
+        else:
+            _save_checkpoint(model, tokenizer, args.output_dir, 0.0)
+
+    logger.info("Solo-Training Complete.")
+    _save_checkpoint(model, tokenizer, args.output_dir / "last", 0.0)
 
 class BackgroundPrefetcher:
     """Zero-Blocking Async Loader replacing PyTorch's native worker queue locks."""

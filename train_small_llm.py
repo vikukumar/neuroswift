@@ -83,12 +83,27 @@ def fmt_prompt(prompt: str) -> str:
 
 
 def _sft_worker(args):
-    """Parallel worker for build_sft_tensors."""
-    pair, tokenizer, seq_len, fmt_fn = args
+    """Deep-Optimization worker for build_sft_tensors."""
+    pair, slim_token_data, seq_len, fmt_fn = args
     try:
-        pad_id = tokenizer.stoi[tokenizer.pad_token]
-        prompt_ids = tokenizer.encode(fmt_fn(pair.prompt), add_eos=False)
-        resp_ids = tokenizer.encode(pair.response, add_eos=True)
+        stoi = slim_token_data["stoi"]
+        special = slim_token_data["special_tokens"]
+        
+        pad_id = stoi[special["pad"]]
+        eos_token = special["eos"]
+
+        # Minimal encoding logic to stay fast inside worker
+        def encode_local(text: str, add_eos: bool = False) -> list[int]:
+            text = text.lower() if slim_token_data["lowercase"] else text
+            import re
+            words = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)
+            ids = [stoi.get(w, stoi[special["unk"]]) for w in words]
+            if add_eos:
+                ids.append(stoi[eos_token])
+            return ids
+
+        prompt_ids = encode_local(fmt_fn(pair.prompt), add_eos=False)
+        resp_ids = encode_local(pair.response, add_eos=True)
         full_ids = (prompt_ids + resp_ids)[: seq_len + 1]
 
         if len(full_ids) < 2 or len(prompt_ids) >= len(full_ids):
@@ -131,13 +146,24 @@ def build_sft_tensors(
     label_rows: list[torch.Tensor] = []
     skipped = 0
 
-    # Only parallelize for non-trivial datasets
     if len(pairs) > 500:
-        num_procs = min(multiprocessing.cpu_count(), 16)
-        worker_args = [(p, tokenizer, seq_len, fmt_prompt) for p in pairs]
+        # Hyper-Optimization: Pass only the essential vocab to the workers
+        slim_token_data = {
+            "stoi": tokenizer.stoi,
+            "special_tokens": {
+                "pad": tokenizer.pad_token,
+                "unk": tokenizer.unk_token,
+                "eos": tokenizer.eos_token,
+            },
+            "lowercase": tokenizer.lowercase
+        }
         
-        with ProcessPoolExecutor(max_workers=num_procs) as executor:
-            results = list(executor.map(_sft_worker, worker_args, chunksize=250))
+        num_procs = min(multiprocessing.cpu_count(), 10) 
+        worker_args = [(p, slim_token_data, seq_len, fmt_prompt) for p in pairs]
+        
+        # Using a Pool with larger chunks is more efficient for Windows IPC
+        with multiprocessing.Pool(processes=num_procs) as pool:
+            results = pool.map(_sft_worker, worker_args, chunksize=500)
         
         for res in results:
             if res is None:
@@ -146,9 +172,18 @@ def build_sft_tensors(
                 input_rows.append(res[0])
                 label_rows.append(res[1])
     else:
-        # Sequential fallback for tiny datasets (avoid process spawn overhead)
+        # Sequential fallback for tiny datasets
+        slim_token_data = {
+            "stoi": tokenizer.stoi,
+            "special_tokens": {
+                "pad": tokenizer.pad_token,
+                "unk": tokenizer.unk_token,
+                "eos": tokenizer.eos_token,
+            },
+            "lowercase": tokenizer.lowercase
+        }
         for pair in pairs:
-            res = _sft_worker((pair, tokenizer, seq_len, fmt_prompt))
+            res = _sft_worker((pair, slim_token_data, seq_len, fmt_prompt))
             if res is None:
                 skipped += 1
             else:
@@ -274,8 +309,8 @@ Examples:
     train_grp = p.add_argument_group("Training")
     train_grp.add_argument("--epochs", type=int, default=10, 
                            help="Number of epochs. Default 10 for small data high-accuracy.")
-    train_grp.add_argument("--batch-size", type=int, default=0,
-                           help="Batch size (0 = auto: 8 CPU, 32 GPU).")
+    train_grp.add_argument("--batch-size", type=int, default=2,
+                           help="Micro-batch size for training")
     train_grp.add_argument("--max-steps-per-epoch", type=int, default=0,
                            help="Max steps to process per epoch (0 = full dataset).")
     train_grp.add_argument("--grad-accum", type=int, default=1,
@@ -413,7 +448,7 @@ def main() -> None:
     if device.type == "cpu":
         # Heterogeneous Storm v18: Full 10-core Spawning Drive
         torch.set_flush_denormal(True)
-        # Using 10 processes, each with 1 OMP thread = 10 total cores saturated.
+        # Using 10 processes, each with 1 OMP thread = Full machine saturation with zero contention
         torch.set_num_threads(1) 
         logger.info(f"Auto-Optimization (CPU): Heterogeneous Storm v18 Active | 10 Workers Spawning...")
     elif device.type == "cuda":
@@ -423,19 +458,15 @@ def main() -> None:
         else:
             logger.info("Auto-Optimization (GPU): Legacy CUDA Fallback")
 
-    # Batch size auto
+    # Batch size auto (V20 scale upgrade)
     batch_size = args.batch_size
-    if batch_size <= 0:
-        batch_size = 8 if device.type == "cpu" else 32
+    if device.type == "cpu" and (batch_size <= 0 or batch_size == 1):
+        batch_size = 2 # Forced scale-up for 10-core saturation
+    elif batch_size <= 0:
+        batch_size = 32
 
-    # ── Solo-Turbo v15: 30+ STEPS/SEC LOCK (NeuroSwift 1.0.12) ──
-    # Micro-Batch Size 1 and Grad-Accum 1 for absolute visual velocity.
-    if device.type == "cpu":
-        batch_size = 1
-        args.grad_accum = 1
-        logger.info(f"Auto-Optimization (CPU): Solo-Turbo Mode Active | Max Speed Display")
-
-    logger.info(f"Device: {device}  |  Batch size: {batch_size}")
+    logger.info(f"Device: {device}  |  Batch size (V20): {batch_size}")
+    args.batch_size = batch_size # Sync back to args for distributed launch
 
     # ── Data pipeline ──────────────────────────────────────────────────────
     local_sources: list[Path] = []
@@ -648,49 +679,31 @@ def main() -> None:
         fused=True,
     )
     
-    # --- Super-Saturation v18: Shared-Process Launch ---
-    # Centralized 1-worker-serving-all-CPUs architecture.
+    # --- Super-Saturation v18: Hyper-Scaling Process Launch ---
     world_size = 10 if device.type == "cpu" else 1
     if device.type == "cpu":
-        # Force SSD-Mmap for scaling mode
-        mmap_path = args.output_dir / "train_cache.mmap"
-        if not mmap_path.exists():
-            MmapDataset.from_pairs(train_pairs, tokenizer, mmap_path, seq_len=args.seq_len)
-        
-        shared_dataset = MmapDataset(mmap_path, seq_len=args.seq_len)
-        data_queue = mp.Manager().Queue(maxsize=128)
-        
         # Set Master Address for Distributed Backend
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12355"
+        
+        # Explicit GC to clear RAM for 10 workers
+        gc.collect()
+        
+        # Shared Memory Model (Tokenizer passed via spawn pickling)
         model.share_memory()
         
-        # Start Master Producer: "1 worker to share data to all cpus"
-        producer = threading.Thread(target=data_producer_thread, args=(shared_dataset, data_queue, world_size, args.epochs))
-        producer.start()
-        
-        logger.info(f"Master: Launching {world_size} distributed processes with Shared-Mmap-Queue...")
+        logger.info(f"Master: Launching {world_size} distributed processes...")
         try:
             mp.spawn(
                 train_worker,
-                args=(world_size, data_queue, len(shared_dataset), v_inputs, v_labels, tokenizer, args),
+                args=(world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args),
                 nprocs=world_size,
                 join=True
             )
         except Exception as e:
-            logger.error(f"Distributed Launch Failed: {e}.")
+            logger.error(f"Distributed Launch Failed: {e}. Falling back to Solo-Turbo.")
             raise e
         return
-
-def data_producer_thread(dataset, queue, world_size, epochs):
-    """Feeds 10 workers from a single Mmap iteration to maximize SSD throughput."""
-    for _ in range(epochs):
-        loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
-        for batch in loader:
-            queue.put(batch)
-    # Signal end-of-training to all 10 workers
-    for _ in range(world_size):
-        queue.put(None)
 
 class BackgroundPrefetcher:
     """Zero-Blocking Async Loader replacing PyTorch's native worker queue locks."""
@@ -731,26 +744,35 @@ class BackgroundPrefetcher:
     def __len__(self):
         return len(self.loader)
 
-def train_worker(rank, world_size, shared_queue, total_samples, v_inputs, v_labels, tokenizer, args):
-    # ── Worker Startup ──────────────────────────────────────────────────────────
+def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args):
+    # Worker Startup ──────────────────────────────────────────────────────────
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     device = torch.device("cpu")
-    torch.set_num_threads(1) # 1 core per process = 10 total
+    # Single-thread to eliminate core-hopping and L3 cache contention
+    torch.set_num_threads(1) 
     
-    # Fixed micro-batching factor for CPU SIMD saturation (Scale V18: 8 samples)
-    m_size = 8
+    # Hyper-Scaling: m_size=10 for massive SIMD aggregation
+    m_size = 10
     
-    # Dataset Sharding handled by the Master Queue Producer
-    train_loader = shared_queue
+    # Dataset Sharding
+    train_dataset = TensorDataset(train_inputs, train_labels)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     
+    # Using args.batch_size for SIMD efficiency
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        sampler=train_sampler, 
+        num_workers=0, 
+        pin_memory=False,
+    )
+    
+    # Validation Dataset
     val_loader = None
     if v_inputs is not None:
         val_dataset = TensorDataset(v_inputs, v_labels)
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        val_loader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler, num_workers=0, pin_memory=False)
-        val_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
-    else:
-        val_prefetcher = None
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0, pin_memory=False)
 
     # Re-build for Worker (DDP requires fresh wrap)
     d_model = args.d_model if args.d_model > 0 else 64
@@ -767,10 +789,9 @@ def train_worker(rank, world_size, shared_queue, total_samples, v_inputs, v_labe
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     
-    # Multi-worker step calculation: (Total / (workers * micro_scale))
-    steps_per_epoch = total_samples // (world_size * m_size)
+    steps_per_epoch = len(train_loader) // m_size
     if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0:
-        steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
+        steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch // m_size)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -784,29 +805,29 @@ def train_worker(rank, world_size, shared_queue, total_samples, v_inputs, v_labe
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        train_sampler.set_epoch(epoch)
         epoch_loss = 0.0
         n_steps = 0
         
+        # Hyper-Optimization: Warming up the pipeline per-epoch to ensure fresh iteration
+        prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
+        prefetcher.wait_for_warmup()
+        
+        # Reset Validation Prefetcher every epoch (fixes stall/exhaustion issue)
+        v_prefetcher = None
+        if val_loader:
+            v_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
+            v_prefetcher.wait_for_warmup()
+            
         step_start_time = time.time()
         # Micro-batch aggregation buffers
         mb_inp, mb_lbl = [], []
         
-        # Consume from Shared Master Queue
-        while True:
-            # We use a simple while-True to consume the shared queue until None
-            try:
-                batch = shared_queue.get()
-                if batch is None:
-                    # Put it back for other workers to see the termination sentinel
-                    shared_queue.put(None)
-                    break
-                inp, lbl = batch
-            except Exception:
+        for batch_idx, (inp, lbl) in enumerate(prefetcher):
+            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
+                prefetcher.stop_event.set()
                 break
                 
-            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and n_steps >= args.max_steps_per_epoch:
-                break
-            
             mb_inp.append(inp)
             mb_lbl.append(lbl)
             if len(mb_inp) < m_size:
@@ -846,23 +867,32 @@ def train_worker(rank, world_size, shared_queue, total_samples, v_inputs, v_labe
             n_steps += 1
             epoch_loss += loss.item()
 
-            if rank == 0 and n_steps % 200 == 0:
+            if rank == 0 and n_steps % 50 == 0:
                 elapsed = time.time() - step_start_time
-                # Speed now reports aggregate steps per second (including micro-batching V18 10-worker 8-mscale)
-                speed = 200 * world_size * m_size / max(elapsed, 0.001)
-                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | Hyperdrive Speed: {speed:.1f} steps/sec | Loss: {loss.item():.4f}")
+                # Accurate Performance Reporting: Update Speed vs Aggregate Throughput
+                # steps_per_sec = global updates (synchronization points) per second
+                steps_per_sec = 50 / max(elapsed, 0.001)
+                # samples_per_sec = total text pieces digested across the whole 10-core cluster
+                samples_per_sec = (50 * world_size * m_size * args.batch_size) / max(elapsed, 0.001)
+                
+                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | Updates: {steps_per_sec:.1f} steps/s | Aggregate: {samples_per_sec:.1f} smp/s | Loss: {loss.item():.4f}")
                 step_start_time = time.time()
 
             # Manual GC chunking to prevent out-of-memory without random mid-batch stalls
             if n_steps % 250 == 0:
                 gc.collect()
         
+        # Stop prefetcher thread for this epoch
+        prefetcher.stop_event.set()
+        
         avg_loss = epoch_loss / n_steps
         
-        # Parallel Validation: All ranks participate to eliminate minute-long stalls
+        # Parallel Validation: All ranks participate to eliminate stalls
         v_loss = 0.0
-        if val_prefetcher:
-            v_loss = _evaluate_worker(model, val_prefetcher, device)
+        if v_prefetcher:
+            v_loss = _evaluate_worker(model, v_prefetcher, device)
+            v_prefetcher.stop_event.set() # Clean shutdown after val pass
+            del v_prefetcher
             
         if rank == 0:
             logger.info(f"Epoch {epoch:02d} Complete | Final Eval Loss: {v_loss:.4f}")

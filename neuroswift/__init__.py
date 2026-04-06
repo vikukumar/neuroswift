@@ -1,3 +1,5 @@
+from __future__ import annotations
+from pathlib import Path
 from ._version import __version__
 from .artifacts_io import ArtifactSaver, OmniArtifact, save_audio, save_image, save_video_frames
 from .auto_trainer import AutoTrainer

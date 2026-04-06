@@ -505,23 +505,29 @@ class NeuroSwiftOmni(nn.Module):
         outputs = self.forward(text_input_ids=input_ids, update_plasticity=False)
         return outputs["video_tensor"]
 
-    def save_pretrained(self, save_directory: str | Path) -> None:
+    def save_pretrained(self, save_directory: str | Path, vocab: Optional[dict[str, Any]] = None) -> None:
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        config_dict = self.config.to_dict()
         (save_dir / "config.json").write_text(
-            json.dumps(self.config.to_dict(), indent=2),
+            json.dumps(config_dict, indent=2),
             encoding="utf-8",
         )
-        save_safetensors_model(
-            self,
-            str(save_dir / "model.safetensors"),
-            metadata={
-                "format": "pt",
-                "model_type": "neuroswift_omni",
-                "creator": "Vikash Kumar",
-            },
-        )
+        
+        # Revert to Safetensors format
+        from safetensors.torch import save_model as _save_safe
+        save_path = save_dir / "model.safetensors"
+        _save_safe(self, str(save_path), metadata={"format": "pt", "model_type": "neuroswift_omni"})
+        
+        # Save vocab separately
+        if vocab:
+            (save_dir / "tokenizer_vocab.json").write_text(
+                json.dumps(vocab, indent=2),
+                encoding="utf-8"
+            )
+            
+        logger.info(f"Omni model saved to {save_path}")
 
     @classmethod
     def from_pretrained(
@@ -532,11 +538,25 @@ class NeuroSwiftOmni(nn.Module):
         if device is None:
             device = auto_device()
         save_dir = Path(save_directory)
-        config = NeuroSwiftOmniConfig.from_dict(
-            json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
-        )
-        model = cls(config)
-        load_safetensors_model(model, save_dir / "model.safetensors", device=str(device))
+        config_path = save_dir / "config.json"
+        safe_path = save_dir / "model.safetensors"
+        model_pt = save_dir / "model.pt"
+
+        if safe_path.exists():
+            config = NeuroSwiftOmniConfig.from_dict(json.loads(config_path.read_text()))
+            model = cls(config)
+            from safetensors.torch import load_model as _load_safe
+            _load_safe(model, safe_path, device=str(device))
+            if len(model.state_dict()) < 50:
+                raise ValueError("Incomplete Omni safetensors checkpoint.")
+        elif model_pt.exists():
+            checkpoint = torch.load(model_pt, map_location=device)
+            config = NeuroSwiftOmniConfig.from_dict(checkpoint["config"])
+            model = cls(config)
+            model.load_state_dict(checkpoint["model_state"], strict=True)
+        else:
+            raise FileNotFoundError(f"No Omni model found at {save_dir}")
+
         model.to(device)
         model.eval()
         return model
@@ -622,10 +642,34 @@ class NeuroSwiftAssistant:
         *,
         device: str | torch.device = "cpu",
     ) -> "NeuroSwiftAssistant":
-        model = NeuroSwiftLM.from_pretrained(model_directory, device=device)
-        tokenizer = load_tokenizer(model_directory)
-        if not isinstance(tokenizer, WordTokenizer):
-            raise TypeError("NeuroSwiftAssistant expects a WordTokenizer-compatible model directory.")
+        save_dir = Path(model_directory)
+        model_pt = save_dir / "model.pt"
+        
+        # Determine model class from config
+        config_path = save_dir / "config.json"
+        is_omni = False
+        if config_path.exists():
+            config_meta = json.loads(config_path.read_text())
+            is_omni = "text_vocab_size" in config_meta or "image_size" in config_meta
+        
+        if is_omni:
+            model = NeuroSwiftOmni.from_pretrained(save_dir, device=device)
+        else:
+            model = NeuroSwiftLM.from_pretrained(save_dir, device=device)
+            
+        tokenizer = load_tokenizer(save_dir)
+        
+        # Vocab Rescue for Assistant
+        if model_pt.exists():
+            checkpoint = torch.load(model_pt, map_location="cpu")
+            if "vocab" in checkpoint and checkpoint["vocab"] and hasattr(tokenizer, "load_vocab"):
+                tokenizer.load_vocab(checkpoint["vocab"])
+                logger.info("[Assistant] Vocab rescued from bundled checkpoint.")
+                
+        if not isinstance(tokenizer, WordTokenizer) and not is_omni:
+             # Relaxing this for CharTokenizer support if needed, but keeping warning
+             logger.warning("NeuroSwiftAssistant is optimized for WordTokenizer.")
+             
         rag = NeuroSwiftRAG(tokenizer=tokenizer)
         return cls(model=model, tokenizer=tokenizer, rag=rag, device=device)
 

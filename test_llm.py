@@ -158,33 +158,57 @@ Examples:
 
 
 def load_model_and_tokenizer(model_dir: Path, device: torch.device, ternary_mode: bool = False):
-    """Auto-detect and load NeuroSwiftLM or NeuroSwiftOmni."""
+    """Auto-detect and load NeuroSwiftLM or NeuroSwiftOmni from a bundled .pt file."""
     from neuroswift.tokenizer import load_tokenizer
 
+    model_pt = model_dir / "model.pt"
+    model_safe = model_dir / "model.safetensors"
     config_path = model_dir / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"No model found at {model_dir}. Run train_small_llm.py first."
-        )
-    config_meta = json.loads(config_path.read_text(encoding="utf-8"))
-    is_omni = "text_vocab_size" in config_meta
+    
+    if not model_safe.exists() and not model_pt.exists() and not config_path.exists():
+        raise FileNotFoundError(f"No model found at {model_dir}. Run training first.")
 
+    # Peek at config for type detection
+    if model_pt.exists() and not model_safe.exists():
+        checkpoint = torch.load(model_pt, map_location="cpu")
+        config_meta = checkpoint.get("config", {})
+    else:
+        config_meta = json.loads(config_path.read_text(encoding="utf-8"))
+        
+    is_omni = "text_vocab_size" in config_meta or "image_size" in config_meta
     tokenizer = load_tokenizer(model_dir)
 
     if is_omni:
         from neuroswift.omni import NeuroSwiftOmni
         model = NeuroSwiftOmni.from_pretrained(model_dir, device=device)
-        return model, tokenizer, "omni"
+        mode = "omni"
     else:
         from neuroswift.model import NeuroSwiftLM
         model = NeuroSwiftLM.from_pretrained(model_dir, device=device)
-        if ternary_mode:
-            model.config.ternary_mode = True
-            # Re-initialize ternary layers if needed or just trigger the logic
-            for m in model.modules():
-                if hasattr(m, "ternary_enabled"):
-                    m.ternary_enabled = True
-        return model, tokenizer, "lm"
+        mode = "lm"
+        
+    # Vocab Rescue: Try model.pt first, then tokenizer_vocab.json
+    vocab_found = False
+    if model_pt.exists():
+        try:
+            ckpt = torch.load(model_pt, map_location="cpu")
+            if "vocab" in ckpt and ckpt["vocab"] and hasattr(tokenizer, "load_vocab"):
+                tokenizer.load_vocab(ckpt["vocab"])
+                vocab_found = True
+        except Exception:
+            pass
+            
+    vocab_json = model_dir / "tokenizer_vocab.json"
+    if not vocab_found and vocab_json.exists() and hasattr(tokenizer, "load_vocab"):
+        tokenizer.load_vocab(json.loads(vocab_json.read_text()))
+        logger.info("Rescued vocab from tokenizer_vocab.json.")
+
+    if mode == "lm" and ternary_mode:
+        model.config.ternary_mode = True
+        for m in model.modules():
+            if hasattr(m, "ternary_enabled"):
+                m.ternary_enabled = True
+    return model, tokenizer, mode
 
 
 # ---------------------------------------------------------------------------

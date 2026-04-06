@@ -395,23 +395,29 @@ class NeuroSwiftLM(nn.Module):
 
         return generated
 
-    def save_pretrained(self, save_directory: str | Path) -> None:
+    def save_pretrained(self, save_directory: str | Path, vocab: Optional[dict[str, Any]] = None) -> None:
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        config_dict = self.config.to_dict()
         (save_dir / "config.json").write_text(
-            json.dumps(self.config.to_dict(), indent=2),
+            json.dumps(config_dict, indent=2),
             encoding="utf-8",
         )
-        save_safetensors_model(
-            self,
-            str(save_dir / "model.safetensors"),
-            metadata={
-                "format": "pt",
-                "model_type": "neuroswift",
-                "creator": "Vikash Kumar",
-            },
-        )
+        
+        # Revert to Safetensors format
+        from safetensors.torch import save_model as _save_safe
+        save_path = save_dir / "model.safetensors"
+        _save_safe(self, str(save_path), metadata={"format": "pt", "model_type": "neuroswift"})
+        
+        # Save vocab separately
+        if vocab:
+            (save_dir / "tokenizer_vocab.json").write_text(
+                json.dumps(vocab, indent=2),
+                encoding="utf-8"
+            )
+            
+        logger.info(f"Model saved to {save_path}")
 
     @classmethod
     def from_pretrained(
@@ -423,26 +429,28 @@ class NeuroSwiftLM(nn.Module):
         if device is None:
             device = auto_device()
         save_dir = Path(save_directory)
-        config = NeuroSwiftConfig.from_dict(
-            json.loads((save_dir / "config.json").read_text(encoding="utf-8"))
-        )
-        model = cls(config, use_checkpoint=use_checkpoint)
-        # Bridge Logic: Safetensors doesn't support 'strict=False' natively in standard load
-        # so we load the tensor dictionary first and remap keys
-        from safetensors import safe_open
-        state_dict = {}
-        with safe_open(save_dir / "model.safetensors", framework="pt", device=str(device)) as f:
-            for k in f.keys():
-                new_k = k
-                # Remap dt_proj (V0) to dt_gate (V1 Selective SSD)
-                if ".ssm.dt_proj." in k:
-                    new_k = k.replace(".ssm.dt_proj.", ".ssm.dt_gate.")
-                state_dict[new_k] = f.get_tensor(k)
-        
-        # Load into model with strict=False to allow expert jitter and newer hooks
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"[NeuroSwift Bridge] Info: Initialized new V1 weights: {len(missing)} keys")
+        config_path = save_dir / "config.json"
+        safe_path = save_dir / "model.safetensors"
+        model_pt = save_dir / "model.pt"
+
+        # Prioritize safetensors primary
+        if safe_path.exists():
+            config = NeuroSwiftConfig.from_dict(json.loads(config_path.read_text()))
+            model = cls(config, use_checkpoint=use_checkpoint)
+            from safetensors.torch import load_model as _load_safe
+            _load_safe(model, safe_path, device=str(device))
+            # Validation: Ensure weights are healthy
+            if len(model.state_dict()) < 50:
+                raise ValueError("Incomplete safetensors checkpoint.")
+        elif model_pt.exists():
+            # Support the temporary .pt bundle format for transition
+            checkpoint = torch.load(model_pt, map_location=device)
+            config = NeuroSwiftConfig.from_dict(checkpoint["config"])
+            model = cls(config, use_checkpoint=use_checkpoint)
+            model.load_state_dict(checkpoint["model_state"], strict=True)
+        else:
+            raise FileNotFoundError(f"No model found at {save_dir}")
+
         model.to(device)
         model.eval()
         return model

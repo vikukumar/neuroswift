@@ -38,6 +38,7 @@ from concurrent.futures import ProcessPoolExecutor
 import os
 import sys
 import time
+import gc
 import threading
 import queue
 from argparse import ArgumentParser
@@ -157,7 +158,14 @@ def build_sft_tensors(
     if not input_rows:
         raise RuntimeError("No valid training examples built.")
 
-    return torch.stack(input_rows), torch.stack(label_rows), skipped
+    inputs = torch.stack(input_rows)
+    labels = torch.stack(label_rows)
+    
+    # Ensure zero-copy IPC: Mark tensors as shared
+    inputs.share_memory_()
+    labels.share_memory_()
+
+    return inputs, labels, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -403,11 +411,11 @@ def main() -> None:
         device = auto_device()
 
     if device.type == "cpu":
-        # Heterogeneous Storm v17: Full 10-core Spawning Drive
+        # Heterogeneous Storm v18: Full 10-core Spawning Drive
         torch.set_flush_denormal(True)
-        # Using 5 processes, each with 2 OMP threads = 10 total cores saturated.
-        torch.set_num_threads(2) 
-        logger.info(f"Auto-Optimization (CPU): Heterogeneous Storm v17 Active | 5 Workers Spawning...")
+        # Using 10 processes, each with 1 OMP thread = 10 total cores saturated.
+        torch.set_num_threads(1) 
+        logger.info(f"Auto-Optimization (CPU): Heterogeneous Storm v18 Active | 10 Workers Spawning...")
     elif device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         if torch.cuda.get_device_capability()[0] >= 8:
@@ -640,36 +648,59 @@ def main() -> None:
         fused=True,
     )
     
-    # --- Super-Saturation v17: Process Launch ---
-    world_size = 5 if device.type == "cpu" else 1
+    # --- Super-Saturation v18: Shared-Process Launch ---
+    # Centralized 1-worker-serving-all-CPUs architecture.
+    world_size = 10 if device.type == "cpu" else 1
     if device.type == "cpu":
+        # Force SSD-Mmap for scaling mode
+        mmap_path = args.output_dir / "train_cache.mmap"
+        if not mmap_path.exists():
+            MmapDataset.from_pairs(train_pairs, tokenizer, mmap_path, seq_len=args.seq_len)
+        
+        shared_dataset = MmapDataset(mmap_path, seq_len=args.seq_len)
+        data_queue = mp.Manager().Queue(maxsize=128)
+        
         # Set Master Address for Distributed Backend
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "12355"
-        # Shared Memory Model (Tokenizer passed via spawn pickling)
         model.share_memory()
         
-        logger.info(f"Master: Launching {world_size} distributed processes...")
+        # Start Master Producer: "1 worker to share data to all cpus"
+        producer = threading.Thread(target=data_producer_thread, args=(shared_dataset, data_queue, world_size, args.epochs))
+        producer.start()
+        
+        logger.info(f"Master: Launching {world_size} distributed processes with Shared-Mmap-Queue...")
         try:
             mp.spawn(
                 train_worker,
-                args=(world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args),
+                args=(world_size, data_queue, len(shared_dataset), v_inputs, v_labels, tokenizer, args),
                 nprocs=world_size,
                 join=True
             )
         except Exception as e:
-            logger.error(f"Distributed Launch Failed: {e}. Falling back to Solo-Turbo.")
+            logger.error(f"Distributed Launch Failed: {e}.")
             raise e
         return
 
+def data_producer_thread(dataset, queue, world_size, epochs):
+    """Feeds 10 workers from a single Mmap iteration to maximize SSD throughput."""
+    for _ in range(epochs):
+        loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
+        for batch in loader:
+            queue.put(batch)
+    # Signal end-of-training to all 10 workers
+    for _ in range(world_size):
+        queue.put(None)
+
 class BackgroundPrefetcher:
     """Zero-Blocking Async Loader replacing PyTorch's native worker queue locks."""
-    def __init__(self, loader, maxsize=32):
+    def __init__(self, loader, maxsize=32, warmup_size=16):
         self.loader = loader
         self.queue = queue.Queue(maxsize=maxsize)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+        self.warmup_size = warmup_size
 
     def _worker(self):
         try:
@@ -681,6 +712,11 @@ class BackgroundPrefetcher:
             pass
         finally:
             self.queue.put(None)
+
+    def wait_for_warmup(self):
+        """Block until the queue has reached the target warmup size to prevent 'cold start' slowness."""
+        while self.queue.qsize() < self.warmup_size and self.thread.is_alive():
+            time.sleep(0.01)
 
     def __iter__(self):
         return self
@@ -695,28 +731,26 @@ class BackgroundPrefetcher:
     def __len__(self):
         return len(self.loader)
 
-def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args):
+def train_worker(rank, world_size, shared_queue, total_samples, v_inputs, v_labels, tokenizer, args):
     # ── Worker Startup ──────────────────────────────────────────────────────────
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     device = torch.device("cpu")
-    torch.set_num_threads(2) # 2 cores per process = 10 total
+    torch.set_num_threads(1) # 1 core per process = 10 total
     
-    # Dataset Sharding
-    train_dataset = TensorDataset(train_inputs, train_labels)
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    # CPU: num_workers=0 is faster for small shared tensors; pin_memory=False stops warnings
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=1, 
-        sampler=train_sampler, 
-        num_workers=0, 
-        pin_memory=False,
-    )
+    # Fixed micro-batching factor for CPU SIMD saturation (Scale V18: 8 samples)
+    m_size = 8
+    
+    # Dataset Sharding handled by the Master Queue Producer
+    train_loader = shared_queue
     
     val_loader = None
     if v_inputs is not None:
         val_dataset = TensorDataset(v_inputs, v_labels)
-        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler, num_workers=0, pin_memory=False)
+        val_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
+    else:
+        val_prefetcher = None
 
     # Re-build for Worker (DDP requires fresh wrap)
     d_model = args.d_model if args.d_model > 0 else 64
@@ -733,7 +767,8 @@ def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_label
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     
-    steps_per_epoch = len(train_loader)
+    # Multi-worker step calculation: (Total / (workers * micro_scale))
+    steps_per_epoch = total_samples // (world_size * m_size)
     if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0:
         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
     total_steps = steps_per_epoch * args.epochs
@@ -744,28 +779,54 @@ def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_label
     best_val_loss = float("inf")
     ema_loss = None
 
+    # Disable automatic GC to prevent erratic deep-training stutters
+    gc.disable()
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        train_sampler.set_epoch(epoch)
         epoch_loss = 0.0
         n_steps = 0
         
         step_start_time = time.time()
-        prefetcher = BackgroundPrefetcher(train_loader, maxsize=32)
-        for batch_idx, (batch_inp, batch_lbl) in enumerate(prefetcher):
-            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
-                prefetcher.stop_event.set()
+        # Micro-batch aggregation buffers
+        mb_inp, mb_lbl = [], []
+        
+        # Consume from Shared Master Queue
+        while True:
+            # We use a simple while-True to consume the shared queue until None
+            try:
+                batch = shared_queue.get()
+                if batch is None:
+                    # Put it back for other workers to see the termination sentinel
+                    shared_queue.put(None)
+                    break
+                inp, lbl = batch
+            except Exception:
                 break
-            batch_inp, batch_lbl = batch_inp.to(device), batch_lbl.to(device)
+                
+            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and n_steps >= args.max_steps_per_epoch:
+                break
+            
+            mb_inp.append(inp)
+            mb_lbl.append(lbl)
+            if len(mb_inp) < m_size:
+                continue
+            
+            # Fused Micro-batch Processing: Cats multiple batches for SIMD throughput
+            batch_inp = torch.cat(mb_inp, dim=0).to(device)
+            batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
+            mb_inp, mb_lbl = [], []
             
             optimizer.zero_grad(set_to_none=True)
             out = model(batch_inp, targets=batch_lbl)
             loss = out["loss"]
             
-            # Massive DDP Speedup: Add dummy parameter sum bypass to prevent unused parameters crash
-            # Doing this allows us to use find_unused_parameters=False which saves constant graph traversals
-            dummy_loss = sum(0.0 * p.sum() for p in model.parameters() if p.requires_grad)
-            loss = loss + dummy_loss
+            # Ultra-Lean DDP Bypass: Minimize Python loop overhead
+            dummy_val = 0.0
+            for p in model.parameters():
+                if p.requires_grad:
+                    dummy_val = dummy_val + p.view(-1)[0]
+            loss = loss + 0.0 * dummy_val
             
             # Loss spike detection & stabilization (Temporary LR dampening)
             current_loss_val = loss.item()
@@ -785,53 +846,72 @@ def train_worker(rank, world_size, train_inputs, train_labels, v_inputs, v_label
             n_steps += 1
             epoch_loss += loss.item()
 
-            if rank == 0 and n_steps % 50 == 0:
+            if rank == 0 and n_steps % 200 == 0:
                 elapsed = time.time() - step_start_time
-                speed = 50 * world_size / max(elapsed, 0.001)
-                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | Aggregate Speed: {speed:.1f} steps/sec | Loss: {loss.item():.4f}")
+                # Speed now reports aggregate steps per second (including micro-batching V18 10-worker 8-mscale)
+                speed = 200 * world_size * m_size / max(elapsed, 0.001)
+                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | Hyperdrive Speed: {speed:.1f} steps/sec | Loss: {loss.item():.4f}")
                 step_start_time = time.time()
 
+            # Manual GC chunking to prevent out-of-memory without random mid-batch stalls
+            if n_steps % 250 == 0:
+                gc.collect()
+        
+        avg_loss = epoch_loss / n_steps
+        
+        # Parallel Validation: All ranks participate to eliminate minute-long stalls
+        v_loss = 0.0
+        if val_prefetcher:
+            v_loss = _evaluate_worker(model, val_prefetcher, device)
+            
         if rank == 0:
-            avg_loss = epoch_loss / n_steps
-            logger.info(f"Epoch {epoch:02d} Complete | Rank 0 Final Loss: {avg_loss:.4f}")
-            if val_loader:
-                v_loss = _evaluate_worker(model, val_loader, device)
-                logger.info(f"Validating: rank 0 val_loss={v_loss:.4f}")
-                if v_loss < best_val_loss:
-                    best_val_loss = v_loss
-                    _save_checkpoint(model.module, tokenizer, args.output_dir, avg_loss, is_best=True)
+            logger.info(f"Epoch {epoch:02d} Complete | Final Eval Loss: {v_loss:.4f}")
+            if val_prefetcher and v_loss < best_val_loss:
+                best_val_loss = v_loss
+                _save_checkpoint(model.module, tokenizer, args.output_dir, avg_loss, is_best=True)
 
     if rank == 0:
         logger.info("Distributed Training Complete. Master exiting...")
         _save_checkpoint(model.module, tokenizer, args.output_dir / "last", 0.0)
 
+    gc.enable()
     dist.destroy_process_group()
 
-def _evaluate_worker(model, loader, device):
-    """Distributed evaluation helper."""
+def _evaluate_worker(model, prefetcher, device):
+    """Distributed evaluation helper using all-reduce for zero-stall sync."""
     model.eval()
-    total, n = 0.0, 0
+    local_total, local_n = 0.0, 0
     with torch.no_grad():
-        for b_i, b_l in loader:
+        for b_i, b_l in prefetcher:
             b_i, b_l = b_i.to(device), b_l.to(device)
             o = model(b_i)
-            # Use standard cross-entropy for validation metrics
             l = F.cross_entropy(o["logits"].view(-1, o["logits"].size(-1)), b_l.view(-1), ignore_index=-100)
-            total += l.item()
-            n += 1
+            local_total += l.item()
+            local_n += 1
+            
+    # Sync across all DDP ranks
+    t_loss = torch.tensor([local_total], device=device)
+    t_count = torch.tensor([local_n], device=device)
+    dist.all_reduce(t_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(t_count, op=dist.ReduceOp.SUM)
+    
     model.train()
-    return total / max(n, 1)
+    return t_loss.item() / max(t_count.item(), 1)
 
 def _save_checkpoint(model, tokenizer, output_dir, last_loss, is_best=False):
     """Unified checkpointing for distributed workers."""
     save_path = Path(output_dir)
     save_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(save_path)
+    
+    # Bundle vocab into the .pt checkpoint
+    vocab_data = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+    
+    model.save_pretrained(save_path, vocab=vocab_data)
     tokenizer.save_pretrained(save_path)
     if is_best:
         best_dir = save_path / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(best_dir)
+        model.save_pretrained(best_dir, vocab=vocab_data)
         tokenizer.save_pretrained(best_dir)
 
 if __name__ == "__main__":

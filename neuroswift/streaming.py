@@ -15,7 +15,7 @@ from typing import Any, Iterator, List
 
 import numpy as np
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset # Corrected from IterableDataset
 
 from .tokenizer import WordTokenizer
 
@@ -30,10 +30,11 @@ def _tokenize_worker_mmap(args):
     return tokenizer.encode(text, add_eos=True)
 
 
-class MmapDataset(IterableDataset):
+class MmapDataset(Dataset): # Corrected from IterableDataset
     """
     God-level dataset that streams tokens from an SSD-backed memmap file.
     Ideal for multi-gigabyte datasets that don't fit in RAM.
+    Supports index-based random access for high-speed shuffling.
     """
     def __init__(
         self,
@@ -54,33 +55,40 @@ class MmapDataset(IterableDataset):
         # One extra token for shifted targets
         self.num_samples = (self.total_tokens - 1) // seq_len
         
+        self._data = None
         logger.info(f"Loaded MmapDataset: {self.num_samples:,} samples ({self.total_tokens:,} tokens)")
+
+    def _get_data(self):
+        if self._data is None:
+            self._data = np.memmap(self.mmap_path, dtype=self.dtype, mode="r")
+        return self._data
 
     def __len__(self) -> int:
         """Returns the total number of samples in the memmap dataset."""
         return self.num_samples
 
-    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        data = np.memmap(self.mmap_path, dtype=self.dtype, mode="r")
-        worker_info = torch.utils.data.get_worker_info()
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Provides fast random access to the raw SSD-backed buffer."""
+        data = self._get_data()
+        start = index * self.seq_len
+        end = start + self.seq_len + 1
         
-        if worker_info is None:
-            iter_range = range(self.num_samples)
+        # Consistent shape for the model training pipeline
+        if end > len(data):
+            chunk = np.zeros(self.seq_len + 1, dtype=np.int64)
+            available = data[start:]
+            chunk[:len(available)] = available.astype(np.int64)
         else:
-            per_worker = int(np.ceil(self.num_samples / float(worker_info.num_workers)))
-            iter_range = range(worker_info.id * per_worker, min((worker_info.id + 1) * per_worker, self.num_samples))
-
-        for i in iter_range:
-            start = i * self.seq_len
-            end = start + self.seq_len + 1
             chunk = data[start:end].astype(np.int64)
             
-            if len(chunk) < self.seq_len + 1:
-                continue
-                
-            input_ids = torch.from_numpy(chunk[:-1])
-            labels = torch.from_numpy(chunk[1:])
-            yield input_ids, labels
+        input_ids = torch.from_numpy(chunk[:-1])
+        labels = torch.from_numpy(chunk[1:])
+        return input_ids, labels
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Maintains simple streaming support."""
+        for i in range(self.num_samples):
+            yield self[i]
 
     @classmethod
     def from_pairs(

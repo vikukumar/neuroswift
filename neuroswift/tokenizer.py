@@ -35,6 +35,13 @@ class CharTokenizer:
     def decode(self, ids: list[int]) -> str:
         return "".join(self.itos[int(idx)] for idx in ids)
 
+    def get_vocab(self) -> dict[str, Any]:
+        return {"stoi": self.stoi, "itos": self.itos, "type": "char"}
+
+    def load_vocab(self, vocab: dict[str, Any]) -> None:
+        self.stoi = dict(vocab["stoi"])
+        self.itos = {int(k): v for k, v in vocab["itos"].items()}
+
     def save_pretrained(self, save_directory: str | Path) -> None:
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +162,29 @@ class WordTokenizer:
                 words.append(" " + token)
 
         return "".join(words).strip()
+
+    def get_vocab(self) -> dict[str, Any]:
+        return {
+            "stoi": self.stoi,
+            "itos": self.itos,
+            "type": "word",
+            "lowercase": self.lowercase,
+            "special_tokens": {
+                "pad": self.pad_token,
+                "unk": self.unk_token,
+                "eos": self.eos_token,
+            }
+        }
+
+    def load_vocab(self, vocab: dict[str, Any]) -> None:
+        self.stoi = dict(vocab["stoi"])
+        self.itos = {int(k): v for k, v in vocab["itos"].items()}
+        self.lowercase = vocab.get("lowercase", True)
+        if "special_tokens" in vocab:
+            s = vocab["special_tokens"]
+            self.pad_token = s.get("pad", "<pad>")
+            self.unk_token = s.get("unk", "<unk>")
+            self.eos_token = s.get("eos", "<eos>")
 
     def save_pretrained(self, save_directory: str | Path) -> None:
         save_dir = Path(save_directory)

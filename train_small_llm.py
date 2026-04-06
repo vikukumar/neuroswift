@@ -902,9 +902,10 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 epoch_loss += current_loss_val
 
                 if rank == 0 and global_step % 1 == 0:
+                    torch.cuda.synchronize() # Barrier for accurate performance profiling
                     dt = time.time() - step_start_time
                     sps = world_size / max(dt, 1e-6)
-                    # Aero-Turbo v34: Displaying total global steps as requested
+                    # Aero-Turbo v35: Displaying total global steps as requested
                     logger.info(
                         f"Step: {batch_idx//args.batch_size} | Global: {global_step * world_size} | Loss: {ema_loss:.4f} | {sps:.1f} smp/s | VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB"
                     )
@@ -932,6 +933,17 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                     _save_checkpoint(raw_mod, tokenizer, args.output_dir, avg_loss, is_best=True)
             
             dist.barrier()
+
+    except Exception as e:
+        if rank == 0:
+            logger.error(f"Distributed Engine Crash: {e}")
+            # Safe Emergency Checkpoint
+            if 'model' in locals():
+                # Correct un-wrapping of DistributedDataParallel (v35 Shield)
+                raw_mod = model.module if hasattr(model, "module") else model
+                _save_checkpoint(raw_mod, tokenizer, args.output_dir / "crash_recovery", 0.0)
+        raise e
+        gc.enable()
 
     finally:
         # Atomic Cleanup: Removing resource leak warnings

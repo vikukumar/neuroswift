@@ -409,14 +409,15 @@ class SparseMoE(nn.Module):
         pos_in_expert = (torch.cumsum(expert_mask, dim=0) - 1) * expert_mask
         pos_in_expert = pos_in_expert.sum(dim=-1) # [TotalActiveTokens]
         
-        # Filter tokens that exceed capacity (v11 safety)
-        valid_mask = pos_in_expert < capacity
-        assigned_tokens = assigned_tokens[valid_mask]
-        assigned_experts = assigned_experts[valid_mask]
-        assigned_weights = assigned_weights[valid_mask]
-        pos_in_expert = pos_in_expert[valid_mask]
+        # Aero-Turbo v35: Absolute Stability Shield (Shape-Invariant Routing)
+        # We NO LONGER filter indices/tokens by capacity mask.
+        # Filtering changes the tensor SHAPE, which causes CheckpointError (Metadata Mismatch).
+        # Fix: We use the valid_mask to zero out weights of tokens that exceed capacity.
+        # This keeps the shape of all tensors identical between forward/backward passes.
+        assigned_weights = assigned_weights * valid_mask.to(assigned_weights.dtype)
         
         # Scatter active tokens to the batched expert tensor
+        # This uses the full potential capacity, ensuring constant-sized tensors.
         x_batched[assigned_experts, pos_in_expert] = tokens[assigned_tokens]
         
         # Fused Expert Forward Pass (One large BMM)

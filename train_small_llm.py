@@ -737,7 +737,8 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     # Explicitly clear cache to prevent OOM fragmentation on startup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.set_per_process_memory_fraction(0.48) # Leave room for the second process + OS
+        # Set memory fraction to 0.45 (Total 0.90) to ensure a stable buffer
+        torch.cuda.set_per_process_memory_fraction(0.45) 
         
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"

@@ -121,9 +121,11 @@ def _sft_worker(args):
         if pad_len < 0:
             return None
 
+        # Return plain lists instead of torch.tensors to avoid shared memory depletion
+        # when passing nearly 100,000 tiny tensors back to the main process.
         return (
-            torch.tensor(input_ids + [pad_id] * pad_len, dtype=torch.long),
-            torch.tensor(labels + [-100] * pad_len, dtype=torch.long)
+            input_ids + [pad_id] * pad_len,
+            labels + [-100] * pad_len
         )
     except Exception:
         return None
@@ -142,8 +144,8 @@ def build_sft_tensors(
     if not pairs:
         return torch.empty(0), torch.empty(0), 0
 
-    input_rows: list[torch.Tensor] = []
-    label_rows: list[torch.Tensor] = []
+    input_rows: list[list[int]] = []
+    label_rows: list[list[int]] = []
     skipped = 0
 
     if len(pairs) > 500:
@@ -193,8 +195,9 @@ def build_sft_tensors(
     if not input_rows:
         raise RuntimeError("No valid training examples built.")
 
-    inputs = torch.stack(input_rows)
-    labels = torch.stack(label_rows)
+    # Convert lists to tensors once in the main process (eliminates shared memory mmap issues)
+    inputs = torch.tensor(input_rows, dtype=torch.long)
+    labels = torch.tensor(label_rows, dtype=torch.long)
     
     # Ensure zero-copy IPC: Mark tensors as shared
     inputs.share_memory_()

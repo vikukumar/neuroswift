@@ -22,9 +22,9 @@ class HebbianUpdater(nn.Module):
         self,
         d_model: int,
         plastic_dim: int = 48,
-        learning_rate: float = 0.05,
+        learning_rate: float = 0.02, # Tuned for Normalized Updates
         decay: float = 0.001,
-        clamp_value: float = 1.5,
+        clamp_value: float = 1.0,    # Stronger clipping against explosion
     ) -> None:
         super().__init__()
         self.plastic_dim = plastic_dim
@@ -85,6 +85,10 @@ class HebbianUpdater(nn.Module):
             fast_weights = x.new_zeros(batch, self.plastic_dim, self.plastic_dim)
 
         adapted = torch.einsum("btd,bdh->bth", pre, fast_weights)
+        
+        # Stability Guard: L2 Normalize to prevent gradient explosion through recurrent loops
+        adapted = torch.nn.functional.normalize(adapted, p=2.0, dim=-1)
+        
         plastic_delta = torch.tanh(self.out_proj(adapted)) * self.output_scale
 
         next_state = fast_weights

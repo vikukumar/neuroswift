@@ -312,6 +312,7 @@ class SparseMoE(nn.Module):
         expert_hidden: int = 256,
         capacity_factor: float = 1.25,
         dropout: float = 0.0,
+        dynamic_top_k: bool = False,
     ) -> None:
         super().__init__()
         if top_k > num_experts:
@@ -321,6 +322,7 @@ class SparseMoE(nn.Module):
         self.aligned_hidden = aligned_hidden
         self.num_experts = num_experts
         self.top_k = top_k
+        self.dynamic_top_k = dynamic_top_k
         self.capacity_factor = capacity_factor
 
         self.norm = RMSNorm(d_model)
@@ -357,13 +359,31 @@ class SparseMoE(nn.Module):
             
         router_probs = torch.softmax(router_logits, dim=-1)
 
-        top_weights, top_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
+        # Dynamic Top-K: If router confidence is low (max prob < 0.5) and dynamic_top_k is enabled, fallback to 2
+        active_top_k = self.top_k
+        if self.dynamic_top_k and self.training and self.top_k == 1:
+            max_probs, _ = router_probs.max(dim=-1)
+            # If avg confidence across batch is very low, increase capacity
+            if max_probs.mean() < 0.5:
+                active_top_k = 2
+
+        top_weights, top_indices = torch.topk(router_probs, k=active_top_k, dim=-1)
         top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        # Calculate Aux Loss Function (Load Balancing Loss)
+        # aux_loss = alpha * N * sum(f_i * P_i)
+        if self.training:
+            router_probs_mean = router_probs.mean(dim=0)
+            token_count = torch.bincount(top_indices.reshape(-1), minlength=self.num_experts).to(x.dtype)
+            token_fraction = token_count / (batch * seq_len * active_top_k)
+            aux_loss = self.num_experts * torch.sum(router_probs_mean * token_fraction)
+        else:
+            aux_loss = torch.tensor(0.0, device=x.device)
 
         flat_output = torch.zeros_like(tokens)
         token_ids = torch.arange(tokens.size(0), device=x.device)
 
-        assigned_tokens = token_ids.repeat_interleave(self.top_k)
+        assigned_tokens = token_ids.repeat_interleave(active_top_k)
         assigned_experts = top_indices.reshape(-1)
         assigned_weights = top_weights.reshape(-1)
 
@@ -373,7 +393,7 @@ class SparseMoE(nn.Module):
         assigned_weights = assigned_weights[order]
 
         capacity = max(
-            self.top_k,
+            active_top_k,
             int(self.capacity_factor * tokens.size(0) / self.num_experts),
         )
 
@@ -400,9 +420,9 @@ class SparseMoE(nn.Module):
             # Note: flat_output already has zero_init outside.
 
 
-        # No aux loss needed with sigmoid load-leveling and entropy-preserving jitter
+        # Optimized Aux-loss returned
         out = residual + self.dropout(flat_output.view(batch, seq_len, d_model))
-        return out, torch.tensor(0.0, device=x.device)
+        return out, aux_loss
 
 
 # ---------------------------------------------------------------------------

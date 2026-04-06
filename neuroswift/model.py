@@ -48,6 +48,14 @@ class NeuroSwiftConfig:
     attn_interval: int = 0  # Reverted default to protection legacy models
     ternary_mode: bool = False  # Enable BitNet-style MatMul-free execution
     latent_dim: int = 64  # Compression for MLA anchors
+    
+    # NeuroSwift v1 Features
+    version: str = "v1"
+    label_smoothing: float = 0.0
+    adaptive_dropout: bool = False
+    stability_module: bool = False
+    dynamic_top_k: bool = True
+    expansion_mode: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -65,6 +73,18 @@ class NeuroSwiftConfig:
             normalized["ternary_mode"] = False
         if "latent_dim" not in normalized:
             normalized["latent_dim"] = 64
+        if "version" not in normalized:
+            normalized["version"] = "v0"
+        if "label_smoothing" not in normalized:
+            normalized["label_smoothing"] = 0.0
+        if "adaptive_dropout" not in normalized:
+            normalized["adaptive_dropout"] = False
+        if "stability_module" not in normalized:
+            normalized["stability_module"] = False
+        if "dynamic_top_k" not in normalized:
+            normalized["dynamic_top_k"] = False
+        if "expansion_mode" not in normalized:
+            normalized["expansion_mode"] = False
         return cls(**normalized)
 
 
@@ -85,6 +105,7 @@ class NeuroSwiftBlock(nn.Module):
             top_k=config.top_k,
             expert_hidden=config.expert_hidden,
             dropout=config.dropout,
+            dynamic_top_k=config.dynamic_top_k,
         )
         self.plasticity = HebbianUpdater(
             d_model=config.d_model,
@@ -101,6 +122,11 @@ class NeuroSwiftBlock(nn.Module):
             else None
         )
         self.thinking_gate = DynamicDepthGate(config.d_model)
+
+        self.expansion_mode = getattr(config, "expansion_mode", False)
+        if self.expansion_mode:
+            self.post_norm = RMSNorm(config.d_model)
+            self.mixing_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
     def forward(
         self,
@@ -135,6 +161,11 @@ class NeuroSwiftBlock(nn.Module):
             update=update_plasticity,
         )
         x = x + thinking_intensity * (x_plastic - x)
+
+        if self.expansion_mode:
+            # Underfitting guard: Extra feature mixing layer (Optional)
+            xm = self.post_norm(x)
+            x = x + 0.1 * self.mixing_proj(xm)
 
         return x, next_ssm_state, next_plastic_state, aux_loss
 
@@ -246,6 +277,7 @@ class NeuroSwiftLM(nn.Module):
             ce_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
+                label_smoothing=self.config.label_smoothing
             )
             
             # Multi-Token Prediction (MTP) Loss - Disabled for 30 steps/sec Hyperdrive
@@ -402,7 +434,7 @@ class NeuroSwiftLM(nn.Module):
         with safe_open(save_dir / "model.safetensors", framework="pt", device=str(device)) as f:
             for k in f.keys():
                 new_k = k
-                # Remap dt_proj (V1) to dt_gate (V2 Selective SSD)
+                # Remap dt_proj (V0) to dt_gate (V1 Selective SSD)
                 if ".ssm.dt_proj." in k:
                     new_k = k.replace(".ssm.dt_proj.", ".ssm.dt_gate.")
                 state_dict[new_k] = f.get_tensor(k)
@@ -410,7 +442,7 @@ class NeuroSwiftLM(nn.Module):
         # Load into model with strict=False to allow expert jitter and newer hooks
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
-            print(f"[NeuroSwift Bridge] Info: Initialized new V2 weights: {len(missing)} keys")
+            print(f"[NeuroSwift Bridge] Info: Initialized new V1 weights: {len(missing)} keys")
         model.to(device)
         model.eval()
         return model

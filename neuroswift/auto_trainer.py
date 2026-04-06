@@ -266,12 +266,16 @@ class AutoTrainer:
                 MmapDataset.from_pairs(pairs, self.tokenizer, mmap_file, seq_len=self.seq_len),
                 batch_size=self.batch_size,
                 shuffle=False, # MmapDataset is usually used for sequential or worker-split streaming
+                num_workers=2,
+                prefetch_factor=4,
             )
         else:
             loader = DataLoader(
                 TensorDataset(inputs, targets),
                 batch_size=self.batch_size,
                 shuffle=True,
+                num_workers=2,
+                prefetch_factor=4,
             )
         self.model.train()
         total_loss = 0.0
@@ -292,6 +296,7 @@ class AutoTrainer:
         else:
             progress = None
 
+        ema_loss = None
         for epoch in range(self.epochs_per_cycle):
             for batch_inputs, batch_targets in loader:
                 batch_inputs = batch_inputs.to(self.device)
@@ -299,6 +304,15 @@ class AutoTrainer:
 
                 out = self.model(batch_inputs, targets=batch_targets, update_plasticity=False)
                 loss = out["loss"]
+                
+                current_loss_val = loss.item()
+                if ema_loss is None:
+                    ema_loss = current_loss_val
+                else:
+                    if current_loss_val > 1.5 * ema_loss and current_loss_val > 0.5:
+                        for pg in self.optimizer.param_groups:
+                            pg["lr"] *= 0.5
+                    ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()

@@ -813,7 +813,8 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     model = DDP(model, device_ids=[rank] if backend == "nccl" else None, find_unused_parameters=False)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    # Modern GradScaler API: Resolves FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated.
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     
     steps_per_epoch = len(train_loader) // m_size
     total_steps = steps_per_epoch * args.epochs
@@ -827,97 +828,112 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     if backend == "gloo":
         gc.disable()
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_sampler.set_epoch(epoch)
-        epoch_loss = 0.0
-        n_steps = 0
-        
-        prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
-        prefetcher.wait_for_warmup()
-        
-        step_start_time = time.time()
-        mb_inp, mb_lbl = [], []
-        
-        for batch_idx, (inp, lbl) in enumerate(prefetcher):
-            mb_inp.append(inp)
-            mb_lbl.append(lbl)
-            if len(mb_inp) < m_size:
-                continue
+    try:
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_sampler.set_epoch(epoch)
+            epoch_loss = 0.0
+            n_steps = 0
+            v_prefetcher = None
             
-            # Fused Micro-batch Processing: Cats multiple batches for SIMD throughput
-            batch_inp = torch.cat(mb_inp, dim=0).to(device)
-            batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
+            # Prefetcher warmup per-epoch to eliminate I/O pauses
+            prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
+            prefetcher.wait_for_warmup()
+            
+            # Parallel Validation Prefetcher: Initialized per-epoch to prevent stalls
+            if val_loader:
+                v_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
+            
+            step_start_time = time.time()
             mb_inp, mb_lbl = [], []
             
-            optimizer.zero_grad(set_to_none=True)
-            out = model(batch_inp, targets=batch_lbl)
-            loss = out["loss"]
-            
-            # Ultra-Lean DDP Bypass: Minimize Python loop overhead
-            dummy_val = 0.0
-            for p in model.parameters():
-                if p.requires_grad:
-                    dummy_val = dummy_val + p.view(-1)[0]
-            loss = loss + 0.0 * dummy_val
-            
-            # Loss spike detection & stabilization (Temporary LR dampening)
-            current_loss_val = loss.item()
-            if ema_loss is None:
-                ema_loss = current_loss_val
-            else:
-                if current_loss_val > 1.5 * ema_loss and current_loss_val > 0.5:
-                    for pg in optimizer.param_groups:
-                        pg["lr"] *= 0.5  # Soft dampening
-                ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
-            
-            global_step += 1
-            n_steps += 1
-            epoch_loss += loss.item()
-
-            if rank == 0 and n_steps % 50 == 0:
-                elapsed = time.time() - step_start_time
-                # Accurate Performance Reporting: Update Speed vs Aggregate Throughput
-                # steps_per_sec = global updates (synchronization points) per second
-                steps_per_sec = 50 / max(elapsed, 0.001)
-                # samples_per_sec = total text pieces digested across the whole 10-core cluster
-                samples_per_sec = (50 * world_size * m_size * args.batch_size) / max(elapsed, 0.001)
+            for batch_idx, (inp, lbl) in enumerate(prefetcher):
+                mb_inp.append(inp)
+                mb_lbl.append(lbl)
+                if len(mb_inp) < m_size:
+                    continue
                 
-                logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | Updates: {steps_per_sec:.1f} steps/s | Aggregate: {samples_per_sec:.1f} smp/s | Loss: {loss.item():.4f}")
-                step_start_time = time.time()
+                # Fused Micro-batch Processing: Cats multiple batches for SIMD throughput
+                batch_inp = torch.cat(mb_inp, dim=0).to(device)
+                batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
+                mb_inp, mb_lbl = [], []
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                with torch.amp.autocast('cuda', enabled=amp_enabled):
+                    # Warp Engine v18: Distributed Inductor Fallback
+                    try:
+                        out = model(batch_inp, targets=batch_lbl)
+                    except Exception as e:
+                        # Catch specific Inductor/Triton/Scan errors that occur in v2.4/v2.5
+                        if "Inductor" in str(e) or "Triton" in str(e) or "list indices" in str(e):
+                            logger.warning(f"  [Rank {rank}] Inductor Crash: {e}. Falling back to Eager-Mode.")
+                            # Re-trying without compile (calling base model/module)
+                            raw_model = model.module
+                            if hasattr(raw_model, "_orig_mod"):
+                                raw_model = raw_model._orig_mod
+                            out = raw_model(batch_inp, targets=batch_lbl)
+                        else:
+                            raise e
+                    
+                    loss = out["loss"]
+                
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
-            # Manual GC chunking to prevent out-of-memory without random mid-batch stalls
-            if n_steps % 250 == 0:
-                gc.collect()
-        
-        # Stop prefetcher thread for this epoch
-        prefetcher.stop_event.set()
-        
-        avg_loss = epoch_loss / n_steps
-        
-        # Parallel Validation: All ranks participate to eliminate stalls
-        v_loss = 0.0
-        if v_prefetcher:
-            v_loss = _evaluate_worker(model, v_prefetcher, device)
-            v_prefetcher.stop_event.set() # Clean shutdown after val pass
-            del v_prefetcher
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                current_loss_val = loss.item()
+                if ema_loss is None:
+                    ema_loss = current_loss_val
+                else:
+                    ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
+
+                global_step += 1
+                n_steps += 1
+                epoch_loss += current_loss_val
+
+                if rank == 0 and n_steps % 50 == 0:
+                    elapsed = time.time() - step_start_time
+                    steps_per_sec = 50 / max(elapsed, 0.001)
+                    samples_per_sec = (50 * world_size * m_size * args.batch_size) / max(elapsed, 0.001)
+                    logger.info(f"  [Epoch {epoch}] Step {n_steps} | Rank 0 Steps/s: {steps_per_sec:.1f} | Global Smp/s: {samples_per_sec:.1f} | Loss: {ema_loss:.4f}")
+                    step_start_time = time.time()
+                
+                if n_steps % 250 == 0:
+                    gc.collect()
             
+            prefetcher.stop_event.set()
+            avg_loss = epoch_loss / max(n_steps, 1)
+            
+            # Parallel Validation: All ranks participate to eliminate stalls
+            v_loss = 0.0
+            if v_prefetcher:
+                v_loss = _evaluate_worker(model, v_prefetcher, device)
+                v_prefetcher.stop_event.set()
+                del v_prefetcher
+                
+            if rank == 0:
+                logger.info(f"Master: Epoch {epoch:02d} Complete | Eval Loss: {v_loss:.4f}")
+                if v_loss < best_val_loss:
+                    best_val_loss = v_loss
+                    _save_checkpoint(model.module, tokenizer, args.output_dir, avg_loss, is_best=True)
+            
+            dist.barrier()
+
+    finally:
         if rank == 0:
-            logger.info(f"Epoch {epoch:02d} Complete | Final Eval Loss: {v_loss:.4f}")
-            if val_prefetcher and v_loss < best_val_loss:
-                best_val_loss = v_loss
-                _save_checkpoint(model.module, tokenizer, args.output_dir, avg_loss, is_best=True)
-
-    if rank == 0:
-        logger.info("Distributed Training Complete. Master exiting...")
-        _save_checkpoint(model.module, tokenizer, args.output_dir / "last", 0.0)
-
-    gc.enable()
-    dist.destroy_process_group()
+            logger.info("Distributed Training Complete. Master exiting...")
+            _save_checkpoint(model.module, tokenizer, args.output_dir / "last", 0.0)
+        
+        gc.enable()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 def _evaluate_worker(model, prefetcher, device):
     """Distributed evaluation helper using all-reduce for zero-stall sync."""

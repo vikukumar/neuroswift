@@ -65,8 +65,8 @@ def fast_associative_scan(u: Tensor, delta: Tensor, A: Tensor, B: Tensor, C: Ten
     drive = delta.unsqueeze(-1) * u.unsqueeze(-1) * B.unsqueeze(2)
 
     # Parallel associative prefix sum in log-space for stability
-    # h_t = cum_decay_t * sum_{s=0}^t (drive_s / (cum_decay_s + 1e-6))
-    hidden = cum_decay * torch.cumsum(drive / (cum_decay + 1e-6), dim=1)
+    # h_t = cum_decay_t * sum_{s=0}^t (drive_s / (cum_decay_s + 1e-5))
+    hidden = cum_decay * torch.cumsum(drive / (cum_decay + 1e-5), dim=1)
     y = (hidden * C.unsqueeze(2)).sum(dim=-1)
     return y
 
@@ -286,6 +286,9 @@ class LinearSSM(nn.Module):
         u = F.silu(u)
 
         delta = F.softplus(self.dt_proj(u)) + self.dt_min
+        # Stability Guard: Clamp delta to prevent exp(A*delta) from collapsing to zero or exploding
+        delta = torch.clamp(delta, max=20.0) 
+        
         b_t, c_t = self.bc_proj(u).chunk(2, dim=-1)
         b_t = torch.tanh(b_t)
         c_t = torch.tanh(c_t)

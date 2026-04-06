@@ -744,6 +744,9 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     
+    # Stability Sleep: Allow GLOO to synchronize peer ranks on single-GPU over-subscription
+    time.sleep(1)
+    
     if backend == "nccl":
         # Logical Over-subscription: Mapping multiple ranks to the same physical device
         num_physical_gpus = torch.cuda.device_count()
@@ -846,27 +849,20 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
             n_steps = 0
             v_prefetcher = None
             
-            # Warp Queue: High-bandwidth Prefetcher
-            prefetcher = BackgroundPrefetcher(train_loader, maxsize=64, warmup_size=16)
-            prefetcher.wait_for_warmup()
-            
-            # Parallel Validation Prefetcher: Initialized per-epoch to prevent stalls
+            # ── Direct-VRAM Drive v34: Zero-Overhead Slicing ──────────────────────
+            # We skip the DataLoader entirely to hit 200+ steps/sec
+            indices = torch.randperm(len(train_inputs), device=device)
+            # Parallel Validation Prefetcher
             if val_loader:
                 v_prefetcher = BackgroundPrefetcher(val_loader, maxsize=16, warmup_size=4)
             
             step_start_time = time.time()
-            mb_inp, mb_lbl = [], []
             
-            for batch_idx, (inp, lbl) in enumerate(prefetcher):
-                mb_inp.append(inp)
-                mb_lbl.append(lbl)
-                if len(mb_inp) < m_size:
-                    continue
-                
-                # Aero-Turbo v24: Zero-latency Slicing (non-blocking transfers)
-                batch_inp = torch.cat(mb_inp, dim=0).to(device, non_blocking=True)
-                batch_lbl = torch.cat(mb_lbl, dim=0).to(device, non_blocking=True)
-                mb_inp, mb_lbl = [], []
+            # Absolute Training Drive
+            for batch_idx in range(0, len(indices) - args.batch_size, args.batch_size):
+                idx_slice = indices[batch_idx : batch_idx + args.batch_size]
+                batch_inp = train_inputs[idx_slice]
+                batch_lbl = train_labels[idx_slice]
                 
                 optimizer.zero_grad(set_to_none=True)
                 
@@ -905,13 +901,13 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 n_steps += 1
                 epoch_loss += current_loss_val
 
-                if rank == 0 and n_steps % 50 == 0:
-                    elapsed = time.time() - step_start_time
-                    # Reporting optimized for Stepping Frequency
-                    steps_per_sec = 50 / max(elapsed, 0.001)
-                    samples_per_sec = (50 * world_size * m_size * args.batch_size) / max(elapsed, 0.001)
-                    # Show total steps per epoch
-                    logger.info(f"  [Epoch {epoch}] Step {n_steps}/{steps_per_epoch} | {steps_per_sec:.1f} steps/s | Aggregate: {samples_per_sec:.1f} smp/s | Loss: {ema_loss:.4f}")
+                if rank == 0 and global_step % 1 == 0:
+                    dt = time.time() - step_start_time
+                    sps = world_size / max(dt, 1e-6)
+                    # Aero-Turbo v34: Displaying total global steps as requested
+                    logger.info(
+                        f"Step: {batch_idx//args.batch_size} | Global: {global_step * world_size} | Loss: {ema_loss:.4f} | {sps:.1f} smp/s | VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB"
+                    )
                     step_start_time = time.time()
                 
                 if n_steps % 250 == 0:

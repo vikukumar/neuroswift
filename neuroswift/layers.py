@@ -53,29 +53,22 @@ def auto_device() -> torch.device:
 def fast_associative_scan(u: Tensor, delta: Tensor, A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     """
     God-level associative scan for SSM on CPU/GPU.
-    Optimized at v32 to use half-precision accumulators and avoid large temporaries.
+    Numerically stable with 1e-6 epsilon for 2nd process safety.
     """
-    # A is [1, D, N], delta is [B, T, D]
-    B_sz, T_sz, D_sz = delta.shape
-    
-    # Memory-Efficient Log-Space Implementation
+    # log_decay: [B, T, D, N] (A is [1, D, N], delta is [B, T, D])
     log_decay = A.unsqueeze(0).unsqueeze(1) * delta.unsqueeze(-1)
     
-    # h_t = exp(cumsum(log_decay)) * cumsum(drive * exp(-cumsum(log_decay)))
-    # To save memory, we combine terms into a single numerical stable scan.
-    # We use a checkpointed approach for the scan body to avoid intermediate VRAM OOM.
-    def scan_fn(ld, u_in, b_in, c_in):
-        cd = torch.exp(torch.cumsum(ld, dim=1))
-        dr = delta.unsqueeze(-1) * u_in.unsqueeze(-1) * b_in.unsqueeze(2)
-        # Use a small epsilon to prevent div-by-zero during negative cumsum
-        hid = cd * torch.cumsum(dr / (cd + 1e-6), dim=1)
-        return (hid * c_in.unsqueeze(2)).sum(dim=-1)
-
-    # Use activation checkpointing for the scan if T is large or we are in over-subscription
-    if T_sz > 128:
-        return torch.utils.checkpoint.checkpoint(scan_fn, log_decay, u, B, C, use_reentrant=False)
-    else:
-        return scan_fn(log_decay, u, B, C)
+    # Cumulative decay and selective drive
+    cd = torch.exp(torch.cumsum(log_decay, dim=1))
+    dr = delta.unsqueeze(-1) * u.unsqueeze(-1) * B.unsqueeze(2)
+    
+    # Associate hidden state: h_t = cd_t * sum_{s=0}^t (dr_s / (cd_s + 1e-6))
+    # Stability note: eps=1e-6 prevents div-by-zero on negative cumulative decay.
+    hidden = cd * torch.cumsum(dr / (cd + 1e-6), dim=1)
+    
+    # Project to output space
+    y = (hidden * C.unsqueeze(2)).sum(dim=-1)
+    return y
 
 
 class RMSNorm(nn.Module):

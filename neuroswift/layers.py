@@ -390,38 +390,42 @@ class SparseMoE(nn.Module):
         assigned_experts = top_indices.reshape(-1)
         assigned_weights = top_weights.reshape(-1)
 
-        order = torch.argsort(assigned_experts)
-        assigned_tokens = assigned_tokens[order]
-        assigned_experts = assigned_experts[order]
-        assigned_weights = assigned_weights[order]
-
         capacity = max(
             active_top_k,
             int(self.capacity_factor * tokens.size(0) / self.num_experts),
         )
 
-        # 3. Hyperdrive v11: Lean Expert Loop (v3)
-        # Replaces Fused BMM with its 30% indexing overhead. Uses optimized loops
-        # with 'index_select' to hit the 30 steps/sec silicon ceiling.
-        for expert_id in range(self.num_experts):
-            mask = (assigned_experts == expert_id)
-            expert_token_ids = assigned_tokens[mask]
-            
-            if expert_token_ids.numel() == 0:
-                continue
-            
-            # High-speed indexed gathering
-            expert_input = tokens.index_select(0, expert_token_ids)
-            # Expert MatMul (OneDNN Fused)
-            h = torch.matmul(expert_input, self.expert_engine.w1[expert_id][:, :self.aligned_hidden * 2])
-            val, gate = h.chunk(2, dim=-1)
-            h = val * F.silu(gate)
-            expert_output = torch.matmul(h, self.expert_engine.w2[expert_id])
-            
-            # Optimized Indexed Accumulation
-            flat_output.index_add_(0, expert_token_ids, (expert_output * assigned_weights[mask].unsqueeze(-1)))
-            # Note: flat_output already has zero_init outside.
-
+        # --- Aero-Turbo v21: Vectorized Expert Execution ---
+        # 1. Group tokens by selected expert and perform one large BMM
+        # This replaces the Python 'for' loop that was throttling GPU performance.
+        # [E, MaxCapacity, D]
+        x_batched = torch.zeros(self.num_experts, capacity, d_model, device=x.device, dtype=x.dtype)
+        
+        # Binary Mask of assignment
+        expert_mask = F.one_hot(assigned_experts, num_classes=self.num_experts) # [TotalActiveTokens, E]
+        expert_counts = expert_mask.sum(dim=0) # [E]
+        
+        # Track position within each expert's capacity
+        pos_in_expert = (torch.cumsum(expert_mask, dim=0) - 1) * expert_mask
+        pos_in_expert = pos_in_expert.sum(dim=-1) # [TotalActiveTokens]
+        
+        # Filter tokens that exceed capacity (v11 safety)
+        valid_mask = pos_in_expert < capacity
+        assigned_tokens = assigned_tokens[valid_mask]
+        assigned_experts = assigned_experts[valid_mask]
+        assigned_weights = assigned_weights[valid_mask]
+        pos_in_expert = pos_in_expert[valid_mask]
+        
+        # Scatter active tokens to the batched expert tensor
+        x_batched[assigned_experts, pos_in_expert] = tokens[assigned_tokens]
+        
+        # Fused Expert Forward Pass (One large BMM)
+        # self.expert_engine performs: val, gate = (x @ W1).chunk(2); h = val * silu(gate); out = h @ W2
+        expert_output_batched = self.expert_engine(x_batched, torch.arange(self.num_experts, device=x.device))
+        
+        # Gather back to flat_output with weights
+        expert_outputs_subset = expert_output_batched[assigned_experts, pos_in_expert]
+        flat_output.index_add_(0, assigned_tokens, expert_outputs_subset * assigned_weights.unsqueeze(-1))
 
         # Optimized Aux-loss returned
         out = residual + self.dropout(flat_output.view(batch, seq_len, d_model))
@@ -485,16 +489,15 @@ class CrossModalAttention(nn.Module):
         k = self.k_proj(self.norm_kv(key_value))
         v = self.v_proj(key_value)
 
-        # Reshape to multi-head (Warp Engine v7)
-        q = q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2).contiguous()    # [B, H, T_q, hd]
-        k = k.view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2).contiguous()   # [B, H, T_kv, hd]
-        v = v.view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2).contiguous()   # [B, H, T_kv, hd]
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale            # [B, H, T_q, T_kv]
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)                                         # [B, H, T_q, hd]
+        # Aero-Turbo v21: Flash Attention Integration
+        # Uses standard SDPA to trigger specialized kernels on GPU
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+            out = F.scaled_dot_product_attention(
+                q, k, v, 
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False # Cross-modal is usually full attention
+            )
+        
         out = out.transpose(1, 2).contiguous().view(B, T_q, D)             # [B, T_q, D]
         out = self.out_proj(out) * self.out_scale
         return query + out

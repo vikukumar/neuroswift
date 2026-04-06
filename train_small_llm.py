@@ -772,7 +772,7 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         amp_enabled = False
     
     # Performance Heuristics: m_size for batch aggregation
-    m_size = 10 if backend == "gloo" else 8
+    m_size = 10 if backend == "gloo" else 4
     
     # Dataset Sharding
     train_dataset = TensorDataset(train_inputs, train_labels)
@@ -845,8 +845,8 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
             n_steps = 0
             v_prefetcher = None
             
-            # Prefetcher warmup per-epoch to eliminate I/O pauses
-            prefetcher = BackgroundPrefetcher(train_loader, maxsize=32, warmup_size=16)
+            # Aero-Turbo v21: Deep-Queue Prefetcher (64 batches)
+            prefetcher = BackgroundPrefetcher(train_loader, maxsize=64, warmup_size=16)
             prefetcher.wait_for_warmup()
             
             # Parallel Validation Prefetcher: Initialized per-epoch to prevent stalls
@@ -863,8 +863,8 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                     continue
                 
                 # Fused Micro-batch Processing: Cats multiple batches for SIMD throughput
-                batch_inp = torch.cat(mb_inp, dim=0).to(device)
-                batch_lbl = torch.cat(mb_lbl, dim=0).to(device)
+                batch_inp = torch.cat(mb_inp, dim=0).to(device, non_blocking=True)
+                batch_lbl = torch.cat(mb_lbl, dim=0).to(device, non_blocking=True)
                 mb_inp, mb_lbl = [], []
                 
                 optimizer.zero_grad(set_to_none=True)

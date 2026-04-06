@@ -633,52 +633,11 @@ def main() -> None:
             auto_plastic_dim = 16 # Enabled Hebbian
             logger.info("Auto-Optimization (CPU): Applied Elite Speed Pruning (d_state=4, d_model=128, Hebbian=ON, Top-K=2).")
 
-        config = NeuroSwiftConfig(
-            vocab_size=tokenizer.vocab_size,
-            d_model=d_model_arg,
-            n_layers=n_layers_arg,
-            d_state=auto_d_state,
-            expansion=2,
-            conv_kernel=4,
-            num_experts=args.num_experts,
-            top_k=auto_top_k,
-            expert_hidden=expert_hidden,
-            plastic_dim=auto_plastic_dim,
-            dropout=args.dropout,
-            aux_loss_scale=1e-2,
-            ternary_mode=auto_ternary,
-            latent_dim=args.latent_dim,
-        )
-        model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
-
-    # Extreme CPU Speed: Unified Compilation (Absolute Performance 1.0.0) ──
-    # NOTE: On GPU, torch.compile often crashes with complex SSM/MoE graphs (SplitScan bug).
-    # We default it to False unless the user explicitly requests it via --compile.
-    should_compile = args.compile
-    if should_compile:
-        logger.info("Initializing 'Absolute Performance' Compilation (torch.compile)...")
-        # Mode 'reduce-overhead' is ideal for NeuroSwift's hybrid SSM/Attention graph
-        model = model.compile(mode="reduce-overhead")
-
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {n_params:,}")
-    logger.info(f"Config: {model.config.to_dict()}")
-
-    # ── Optimizer + scheduler ───────────────────────────────────────────────
-    # Separate weight-decay from bias/norm params
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim < 2]
-
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": args.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=args.lr,
-        fused=True,
-    )
+    # ── Memory-Shield v31: Offloading Initialization to Workers ─────────────
+    # We no longer initialize the model or optimizer in the master process.
+    # This keeps the master RAM footprint < 1GB, preventing SIGKILL/OOM.
     
-    # ── Distributed Architecture: Aero-Turbo Overdrive (v30) ────────────────
+    # ── Distributed Architecture: Aero-Turbo Overdrive (v31) ────────────────
     # Aero-Intelligence: Auto-detecting over-subscription mode
     world_size = 1
     backend = "gloo"
@@ -704,25 +663,21 @@ def main() -> None:
         world_size = 10 
         backend = "gloo"
 
-    # ── VRAM-Master Mode: Move Entire Dataset to GPU ────────────────────────
-    # This is the 'Absolute Performance' mode to hit 200+ steps/sec
-    if device.type == "cuda":
-        logger.info(f"  [AERO-TURBO v27] VRAM-MASTER ACTIVE: Mapping {len(train_inputs):,} samples to GPU...")
-        train_inputs = train_inputs.to(device)
-        train_labels = train_labels.to(device)
-        if v_inputs is not None:
-            v_inputs = v_inputs.to(device)
-            v_labels = v_labels.to(device)
-
     logger.info(f"Master: Launching {world_size} Absolute Engine Processes ({backend})...")
     
-    model.share_memory()
+    # Ensure CPU tensors are shared for zero-copy access by workers
+    train_inputs.share_memory_()
+    train_labels.share_memory_()
+    if v_inputs is not None:
+        v_inputs.share_memory_()
+        v_labels.share_memory_()
+
     gc.collect()
     
     try:
         mp.spawn(
             train_worker,
-            args=(world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args),
+            args=(world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, d_model_arg, n_layers_arg),
             nprocs=world_size,
             join=True
         )
@@ -768,9 +723,8 @@ class BackgroundPrefetcher:
             raise StopIteration
         return batch
 
-def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args):
-    # Aero-Turbo v29: Absolute Sync Protection
-    # Re-apply environment to ensure each spawned process is aware of the master node
+def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, d_model, n_layers):
+    # Aero-Turbo v31: Absolute Sync Protection
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -783,9 +737,53 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         torch.cuda.set_device(device)
         amp_enabled = True
     else:
-        device = torch.device("cpu")
+        # Gloo/CPU Mode
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda": torch.cuda.set_device(device)
         torch.set_num_threads(1)
-        amp_enabled = False
+        amp_enabled = (device.type == "cuda")
+
+    # ── Memory-Shield v31: Late VRAM Loading ───────────────────────────────
+    # Move the dataset to GPU locally in the worker to prevent master OOM
+    if device.type == "cuda":
+        if rank == 0: logger.info(f"  [v31 MASTER] VRAM-MASTER ACTIVE: Mapping {len(train_inputs):,} samples to {device}...")
+        train_inputs = train_inputs.to(device)
+        train_labels = train_labels.to(device)
+        if v_inputs is not None:
+            v_inputs = v_inputs.to(device)
+            v_labels = v_labels.to(device)
+    
+    # ── Memory-Shield v31: Late Model/Optimizer Initialization ────────────
+    # This prevents the master process from being killed by the OOM Killer
+    expert_hidden = args.expert_hidden if args.expert_hidden > 0 else d_model * 2
+    
+    # Auto-Configuration Logic (Consistent across ranks)
+    auto_ternary = args.ternary or (device.type == "cpu")
+    auto_top_k = args.top_k if hasattr(args, "top_k") else 2
+    auto_d_state = 4 if device.type == "cpu" else args.d_state
+    auto_plastic_dim = 16 if device.type == "cpu" else args.plastic_dim
+
+    config = NeuroSwiftConfig(
+        vocab_size=tokenizer.vocab_size,
+        d_model=d_model, n_layers=n_layers,
+        d_state=auto_d_state, expansion=2, conv_kernel=4, num_experts=args.num_experts,
+        top_k=auto_top_k, expert_hidden=expert_hidden, plastic_dim=auto_plastic_dim,
+        dropout=args.dropout, aux_loss_scale=1e-2, ternary_mode=auto_ternary,
+        latent_dim=args.latent_dim,
+    )
+    
+    model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
+    
+    if args.compile:
+        try: model = model.compile(mode="reduce-overhead")
+        except: pass
+
+    if world_size > 1:
+        ddp_device_id = [rank % torch.cuda.device_count()] if backend == "nccl" else None
+        model = DDP(model, device_ids=ddp_device_id, find_unused_parameters=True)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     
     # Set aggregation: m_size=1 for maximum 'Steps/s' (Hitting 200+ objective)
     m_size = 10 if backend == "gloo" else 1
@@ -807,21 +805,6 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
 
-    # Re-build Model for rank
-    d_model = args.d_model if args.d_model > 0 else 384
-    config = NeuroSwiftConfig(
-        vocab_size=tokenizer.vocab_size, d_model=d_model,
-        n_layers=args.n_layers if args.n_layers > 0 else 12,
-        d_state=4, expansion=2, conv_kernel=4, num_experts=args.num_experts,
-        top_k=2, expert_hidden=d_model*2, plastic_dim=16, ternary_mode=(backend == "gloo"),
-    )
-    model = NeuroSwiftLM(config).to(device)
-    
-    if args.compile:
-        try: model = model.compile(mode="default")
-        except: pass
-
-    if world_size > 1:
         # Aero-Intelligence v30: NCCL requires device_ids, GLOO requires None for single-GPU stability
         # Mapping ranks to physical device IDs
         ddp_device_id = [rank % torch.cuda.device_count()] if backend == "nccl" else None

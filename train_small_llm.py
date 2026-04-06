@@ -759,9 +759,11 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     
     if backend == "nccl":
-        device = torch.device(f"cuda:{rank}")
+        # Physical GPU Mapping for logical over-subscription
+        num_physical_gpus = torch.cuda.device_count()
+        physical_gpu_id = rank % num_physical_gpus
+        device = torch.device(f"cuda:{physical_gpu_id}")
         torch.cuda.set_device(device)
-        # Using BF16/FP16 if GPU supports it
         amp_enabled = True
     else:
         device = torch.device("cpu")
@@ -778,6 +780,11 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     
     # Dataset Sharding
     train_dataset = TensorDataset(train_inputs, train_labels)
+    # Aero-Turbo v24: Multi-Process over-subscription (multiple ranks per physical GPU)
+    num_physical_gpus = torch.cuda.device_count() if backend == "nccl" else 1
+    physical_gpu_id = rank % num_physical_gpus if num_physical_gpus > 0 else 0
+    device = torch.device(f"cuda:{physical_gpu_id}" if backend == "nccl" else "cpu")
+    
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     
     train_loader = DataLoader(
@@ -785,7 +792,7 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         batch_size=args.batch_size, 
         sampler=train_sampler, 
         num_workers=0, 
-        pin_memory=(backend == "nccl"),
+        pin_memory=(backend == "nccl" and train_inputs.device.type == "cpu"),
     )
     
     val_loader = None
@@ -794,12 +801,11 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
 
-    # Re-build Model for rank (DDP requires fresh wrap)
-    d_model = args.d_model if args.d_model > 0 else 64
+    # Re-build Model for rank
+    d_model = args.d_model if args.d_model > 0 else 384
     config = NeuroSwiftConfig(
-        vocab_size=tokenizer.vocab_size,
-        d_model=d_model,
-        n_layers=args.n_layers if args.n_layers > 0 else 2,
+        vocab_size=tokenizer.vocab_size, d_model=d_model,
+        n_layers=args.n_layers if args.n_layers > 0 else 12,
         d_state=4, expansion=2, conv_kernel=4, num_experts=args.num_experts,
         top_k=2, expert_hidden=d_model*2, plastic_dim=16, ternary_mode=(backend == "gloo"),
     )
@@ -814,14 +820,12 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
 
     # Warp Engine: Optimize DDP based on process count
     if world_size > 1:
-        # find_unused_parameters=True is REQUIRED for NeuroSwift architectures due to:
-        # 1. Sparse MoE 전문가 selection (some weights not part of every step)
-        # 2. Sequential gating (some attention patterns not always active)
-        model = DDP(model, device_ids=[rank] if backend == "nccl" else None, find_unused_parameters=True)
+        # For logical over-subscription, we map all processes on the same physical GPU to the same device_id
+        model = DDP(model, device_ids=[physical_gpu_id] if backend == "nccl" else None, find_unused_parameters=True)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     # Modern GradScaler API: Resolves FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated.
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+    scaler = torch.amp.GradScaler('cuda', enabled=(backend == "nccl"))
     
     steps_per_epoch = len(train_loader) // m_size
     total_steps = steps_per_epoch * args.epochs
@@ -859,7 +863,7 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 if len(mb_inp) < m_size:
                     continue
                 
-                # Fused Micro-batch Processing: Cats multiple batches for SIMD throughput
+                # Aero-Turbo v24: Zero-latency Slicing (non-blocking transfers)
                 batch_inp = torch.cat(mb_inp, dim=0).to(device, non_blocking=True)
                 batch_lbl = torch.cat(mb_lbl, dim=0).to(device, non_blocking=True)
                 mb_inp, mb_lbl = [], []

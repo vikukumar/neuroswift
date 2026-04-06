@@ -654,7 +654,16 @@ def main() -> None:
             # Using GLOO for stable over-subscription on single-GPU hardware.
             world_size = 2 
             backend = "gloo"
-            logger.info("[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to GLOO backend for absolute stability.")
+            
+            # Aero-Turbo v32: OOM Shield for single-GPU over-subscription
+            # We MUST enable grad checkpointing to fit two processes on one device.
+            # We also cap batch size to 2 to prevent activation OOM.
+            args.grad_checkpoint = True
+            if args.batch_size > 2:
+                logger.info(f"[OOM-SHIELD] Reducing batch size {args.batch_size} -> 2 for 2-process GPU-sharing stability.")
+                args.batch_size = 2
+                
+            logger.info("[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to GLOO + OOM-Shield (Checkpointing=ON, Batch=2).")
         else:
             # Professional NCCL for multi-GPU clusters
             world_size = num_physical_gpus 
@@ -724,7 +733,12 @@ class BackgroundPrefetcher:
         return batch
 
 def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, d_model, n_layers):
-    # Aero-Turbo v31: Absolute Sync Protection
+    # Aero-Turbo v32: Absolute Sync Protection
+    # Explicitly clear cache to prevent OOM fragmentation on startup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.48) # Leave room for the second process + OS
+        
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group(backend, rank=rank, world_size=world_size)

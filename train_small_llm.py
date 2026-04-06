@@ -656,10 +656,10 @@ def main() -> None:
         )
         model = NeuroSwiftLM(config, use_checkpoint=args.grad_checkpoint).to(device)
 
-    # ── Extreme CPU Speed: Unified Compilation (Absolute Performance 1.0.0) ──
-    # NOTE: On Windows/CPU, torch.compile often causes extreme runtime deadlocks.
-    # We default it to True ONLY for Linux or Cuda for stability.
-    should_compile = args.compile or (device.type == "cuda" and hasattr(torch, "compile"))
+    # Extreme CPU Speed: Unified Compilation (Absolute Performance 1.0.0) ──
+    # NOTE: On GPU, torch.compile often crashes with complex SSM/MoE graphs (SplitScan bug).
+    # We default it to False unless the user explicitly requests it via --compile.
+    should_compile = args.compile
     if should_compile:
         logger.info("Initializing 'Absolute Performance' Compilation (torch.compile)...")
         # Mode 'reduce-overhead' is ideal for NeuroSwift's hybrid SSM/Attention graph
@@ -751,7 +751,21 @@ def main() -> None:
             batch_inp, batch_lbl = batch_inp.to(device), batch_lbl.to(device)
             
             optimizer.zero_grad(set_to_none=True)
-            out = model(batch_inp, targets=batch_lbl)
+            
+            # Warp Engine v18: Inductor Fallback (fixes GPU-Inductor crashes in v2.4/2.5)
+            try:
+                out = model(batch_inp, targets=batch_lbl)
+            except Exception as e:
+                # Catch specific Inductor/Triton/Scan errors that occur in v2.4/v2.5
+                if "Inductor" in str(e) or "Triton" in str(e) or "list indices" in str(e):
+                    logger.warning(f"  [NeuroSwift] Inductor Crash detected: {e}. Falling back to Eager-Mode for stability.")
+                    # Re-trying without compile (calling base model)
+                    if hasattr(model, "_orig_mod"):
+                        model = model._orig_mod
+                    out = model(batch_inp, targets=batch_lbl)
+                else:
+                    raise e
+            
             loss = out["loss"]
             
             # Loss spike detection & stabilization

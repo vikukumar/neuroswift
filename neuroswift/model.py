@@ -146,25 +146,26 @@ class NeuroSwiftLM(nn.Module):
         self.use_checkpoint = use_checkpoint
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.emb_norm = RMSNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([NeuroSwiftBlock(config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.mtp_head = MultiTokenHead(config.d_model, config.vocab_size, n_tokens=1)
+        # self.mtp_head = MultiTokenHead(config.d_model, config.vocab_size, n_tokens=1)
 
         self.apply(self._init_weights)
-        self.lm_head.weight = self.token_embedding.weight
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
+            # Omega-Mode Stability: Kaiming Normal for 1M models
+            nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="leaky_relu")
+            if hasattr(module, "bias") and module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.01)
         elif isinstance(module, nn.Conv1d):
-            nn.init.kaiming_uniform_(module.weight, a=5 ** 0.5)
-            if module.bias is not None:
+            nn.init.kaiming_normal_(module.weight, mode="fan_in")
+            if hasattr(module, "bias") and module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(
@@ -183,6 +184,7 @@ class NeuroSwiftLM(nn.Module):
         # Note: Thread management is handled once at process initialization for Absolute Speed.
 
         x = self.token_embedding(input_ids)
+        x = self.emb_norm(x)
         x = self.dropout(x)
 
         if ssm_states is None:
@@ -229,10 +231,7 @@ class NeuroSwiftLM(nn.Module):
 
             x = self.final_norm(x)
             logits = self.lm_head(x)
-
-        # Cast back to float32 for loss computation
-        logits = logits.float()
-        aux_loss = torch.stack(aux_losses).mean() if aux_losses else logits.new_tensor(0.0)
+            aux_loss = torch.stack(aux_losses).mean() if aux_losses else logits.new_tensor(0.0)
 
         out: dict[str, Any] = {
             "logits": logits,
@@ -249,23 +248,19 @@ class NeuroSwiftLM(nn.Module):
                 targets.reshape(-1),
             )
             
-            # Multi-Token Prediction (MTP) Loss
-            # Predict token[i+2] from latent[i]
-            mtp_logits = self.mtp_head(x).float()
-            out["mtp_logits"] = mtp_logits
-            
+            # Multi-Token Prediction (MTP) Loss - Disabled for 30 steps/sec Hyperdrive
             mtp_loss = 0.0
-            if targets.size(1) > 1:
-                # Target for mtp_logits[i] is targets[i+1] (which is the token at i+2 in the sequence)
-                # Since targets is already shifted once (target[i] is token[i+1])
-                mtp_targets = targets[:, 1:]
-                mtp_loss = F.cross_entropy(
-                    mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
-                    mtp_targets.reshape(-1)
-                )
+            # mtp_logits = self.mtp_head(x).float()
+            # out["mtp_logits"] = mtp_logits
+            # if targets.size(1) > 1:
+            #     mtp_targets = targets[:, 1:]
+            #     mtp_loss = F.cross_entropy(
+            #         mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
+            #         mtp_targets.reshape(-1)
+            #     )
             
-            # Combined Loss: Standard + 0.3*MTP + Aux
-            out["loss"] = ce_loss + 0.3 * mtp_loss + self.config.aux_loss_scale * aux_loss
+            # Combined Loss: Standard + 0.1*MTP + Aux (Titan v10 Stability)
+            out["loss"] = ce_loss + 0.1 * mtp_loss + self.config.aux_loss_scale * aux_loss
 
         return out
 

@@ -33,10 +33,14 @@ class HebbianUpdater(nn.Module):
         self.clamp_value = clamp_value
 
         self.norm = RMSNorm(d_model)
-        self.pre_proj = nn.Linear(d_model, plastic_dim, bias=False)
-        self.post_proj = nn.Linear(d_model, plastic_dim, bias=False)
+        if plastic_dim > 0:
+            self.pre_proj = nn.Linear(d_model, plastic_dim, bias=False)
+            self.post_proj = nn.Linear(d_model, plastic_dim, bias=False)
+            self.out_proj = nn.Linear(plastic_dim, d_model, bias=False)
+        else:
+            self.pre_proj = self.post_proj = self.out_proj = None
+            
         self.mod_proj = nn.Linear(d_model, 1)
-        self.out_proj = nn.Linear(plastic_dim, d_model, bias=False)
         self.output_scale = nn.Parameter(torch.full((d_model,), 0.1))
 
     def update_state(
@@ -70,6 +74,8 @@ class HebbianUpdater(nn.Module):
         batch = x.size(0)
         residual = x
         x_norm = self.norm(x)
+        if self.plastic_dim <= 0 or self.pre_proj is None:
+            return residual, x.new_zeros(batch, 1, 1) # Dummy state for 0-dim
 
         pre = torch.tanh(self.pre_proj(x_norm))
         post = torch.tanh(self.post_proj(x_norm))

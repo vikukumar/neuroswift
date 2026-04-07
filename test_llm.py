@@ -503,23 +503,15 @@ def main() -> None:
         final_prompt = f"{time_context}\n\nQuestion: {user_prompt}"
         
         if assistant is not None:
-            # Use web search if requested
-            if args.web_search:
-                logger.info("Web-Search RAG enabled.")
-                web_hits = assistant.rag.web_query(user_prompt)
-                if web_hits:
-                    # Injected manually into prompt for now
-                    web_text = assistant.rag.format_hits(web_hits)
-                    final_prompt = f"Web Search Context:\n{web_text}\n\n{final_prompt}"
-
             result = assistant.answer(
-                final_prompt,
+                user_prompt,
                 retrieve_k=args.retrieve_k,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=rep_penalty,
+                use_web_search=args.web_search,
             )
             answer = result["answer"]
             answer_source = result["answer_source"]

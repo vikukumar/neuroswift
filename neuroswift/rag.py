@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from collections import Counter
@@ -314,11 +315,12 @@ class NeuroSwiftRAG:
 
             snippet = hit.document.text.replace("\r", " ").strip()
             snippet = " ".join(snippet.split())
-            snippet = snippet[: min(remaining, 700)]
-            section = (
-                f"[{hit_idx}] modality={hit.document.modality} "
-                f"source={hit.document.source} score={hit.score:.3f}\n{snippet}"
-            )
+            snippet = snippet[: min(remaining, 1000)]
+            # Clean formatting for small models (v25)
+            # Remove 'modality=' and 'source=' etc. to prevent the model from memorizing metadata
+            source_name = Path(hit.document.source).name
+            section = f"[Context from {source_name}]\n{snippet}"
+            
             sections.append(section)
             remaining -= len(section)
         return "\n\n".join(sections)

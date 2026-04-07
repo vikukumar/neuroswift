@@ -43,7 +43,8 @@ class NeuroSwiftConfig:
     top_k: int = 2
     expert_hidden: int = 256
     plastic_dim: int = 48
-    dropout: float = 0.1
+    dropout: float = 0.15
+    emb_dropout: float = 0.05
     aux_loss_scale: float = 1e-2
     attn_interval: int = 0  # Reverted default to protection legacy models
     ternary_mode: bool = False  # Enable BitNet-style MatMul-free execution
@@ -76,7 +77,9 @@ class NeuroSwiftConfig:
         if "version" not in normalized:
             normalized["version"] = "v0"
         if "label_smoothing" not in normalized:
-            normalized["label_smoothing"] = 0.0
+            normalized["label_smoothing"] = 0.05
+        if "emb_dropout" not in normalized:
+            normalized["emb_dropout"] = 0.05
         if "adaptive_dropout" not in normalized:
             normalized["adaptive_dropout"] = False
         if "stability_module" not in normalized:
@@ -179,12 +182,28 @@ class NeuroSwiftLM(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.emb_norm = RMSNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
+        self.emb_dropout = nn.Dropout(config.emb_dropout)
         self.blocks = nn.ModuleList([NeuroSwiftBlock(config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         # self.mtp_head = MultiTokenHead(config.d_model, config.vocab_size, n_tokens=1)
 
         self.apply(self._init_weights)
+
+    def num_parameters(self, only_trainable: bool = True) -> int:
+        """Returns total or trainable parameter count."""
+        if only_trainable:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
+
+    def num_parameters_formatted(self) -> str:
+        """Returns scale-aware parameter string (e.g. 1.2M, 850K)."""
+        count = self.num_parameters()
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M"
+        elif count >= 1_000:
+            return f"{count / 1_000:.1f}K"
+        return str(count)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -216,7 +235,7 @@ class NeuroSwiftLM(nn.Module):
 
         x = self.token_embedding(input_ids)
         x = self.emb_norm(x)
-        x = self.dropout(x)
+        x = self.emb_dropout(x)
 
         if ssm_states is None:
             ssm_states = [None] * len(self.blocks)
@@ -400,6 +419,8 @@ class NeuroSwiftLM(nn.Module):
         save_dir.mkdir(parents=True, exist_ok=True)
 
         config_dict = self.config.to_dict()
+        config_dict["parameter_count"] = self.num_parameters_formatted()
+        
         (save_dir / "config.json").write_text(
             json.dumps(config_dict, indent=2),
             encoding="utf-8",
@@ -439,8 +460,8 @@ class NeuroSwiftLM(nn.Module):
             model = cls(config, use_checkpoint=use_checkpoint)
             from safetensors.torch import load_model as _load_safe
             _load_safe(model, safe_path, device=str(device))
-            # Validation: Ensure weights are healthy
-            if len(model.state_dict()) < 50:
+            # Validation: Ensure weights are healthy (v23: lowered to 10 for 1-layer compatibility)
+            if len(model.state_dict()) < 10:
                 raise ValueError("Incomplete safetensors checkpoint.")
         elif model_pt.exists():
             # Support the temporary .pt bundle format for transition

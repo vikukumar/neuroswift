@@ -792,6 +792,7 @@ class NeuroSwiftAssistant:
         top_p: float = 1.0,
         repetition_penalty: float = 1.05,
         use_ssi: bool = True,
+        use_web_search: bool = False,
     ) -> dict[str, Any]:
         intent = infer_prompt_intent(prompt)
         hits = self.rag.query(
@@ -800,8 +801,8 @@ class NeuroSwiftAssistant:
             preferred_modality="qa" if intent.task == "qa" else None,
         )
         
-        # Phase 0: Web-Search Fallback for "Live Intelligence"
-        if not hits or intent.task in ("research", "qa"):
+        # Phase 0: Web-Search Fallback (Explicitly Enabled)
+        if use_web_search and (not hits or intent.task in ("research", "qa")):
             web_hits = self.rag.web_query(prompt, top_k=2)
             if web_hits:
                 hits = list(web_hits) + list(hits)

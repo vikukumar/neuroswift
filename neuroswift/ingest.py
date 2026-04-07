@@ -104,7 +104,7 @@ def _tensor_from_image(image: Any) -> torch.Tensor:
         raise RuntimeError("Pillow is required.")
     rgb = image.convert("RGB")
     width, height = rgb.size
-    raw = torch.ByteTensor(torch.ByteStorage.from_buffer(rgb.tobytes()))
+    raw = torch.ByteTensor(torch.UntypedStorage.from_buffer(rgb.tobytes(), dtype=torch.uint8))
     return raw.view(height, width, 3).permute(2, 0, 1).float() / 255.0
 
 

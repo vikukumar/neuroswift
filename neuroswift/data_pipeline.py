@@ -123,8 +123,8 @@ class UniversalSchemaMapper:
     God-level schema mapper that automatically finds 'prompt' and 'response' 
     like fields in any dictionary using fuzzy matching and heuristics.
     """
-    _PROMPT_HINTS = {"prompt", "instruction", "input", "question", "human", "user", "query", "q", "title", "header", "topic"}
-    _RESP_HINTS = {"response", "output", "answer", "assistant", "gpt", "model", "a", "body", "content", "text", "summary", "description"}
+    _PROMPT_HINTS = {"prompt", "instruction", "input", "question", "human", "user", "query", "q", "title", "header", "topic", "goal", "task", "subject", "image_url", "context"}
+    _RESP_HINTS = {"response", "output", "answer", "assistant", "gpt", "model", "a", "body", "content", "text", "summary", "description", "solution", "explanation", "code", "completion", "label", "caption", "target"}
 
     @classmethod
     def map_obj(cls, obj: dict[str, Any], source: str = "") -> TrainPair | None:
@@ -133,7 +133,6 @@ class UniversalSchemaMapper:
 
         # 1. OpenAI Message Format Support
         if "messages" in obj and isinstance(obj["messages"], list):
-            # Take last user message as prompt, last assistant as response
             p, r = "", ""
             for m in obj["messages"]:
                 if m.get("role") == "user": p = m.get("content", "")
@@ -149,86 +148,57 @@ class UniversalSchemaMapper:
                 elif role in ("gpt", "assistant"): r = m.get("value", "")
             if p and r: return TrainPair(prompt=p, response=r, source=source)
         
-        # 3. Exact match pass
+        # 3. Instruction-Context Formats (Dolly, Alpaca, etc.)
+        if "instruction" in obj:
+            p = str(obj["instruction"]).strip()
+            # Merge context if available
+            ctx = obj.get("context") or obj.get("input")
+            if ctx: p += "\n\nContext:\n" + str(ctx).strip()
+            # Find response
+            r = obj.get("response") or obj.get("output") or obj.get("answer")
+            if p and r: return TrainPair(prompt=p, response=str(r).strip(), source=source)
+
+        # 4. Reason-Solution Formats (Goal, Task, Solution)
+        if "goal" in obj or "task" in obj:
+            p = str(obj.get("goal") or obj.get("task")).strip()
+            r = obj.get("solution") or obj.get("explanation") or obj.get("answer")
+            if p and r: return TrainPair(prompt=p, response=str(r).strip(), source=source)
+
+        # 5. Exact match pass
         for pk, rk in _EXACT_MAPPINGS:
             p, r = str(obj.get(pk, "")).strip(), str(obj.get(rk, "")).strip()
             if p and r: return TrainPair(prompt=p, response=r, source=source)
 
-        # 4. Fuzzy match pass
-        keys = list(obj.keys())
-
-
-class WebScraper:
-    """
-    High-performance, parallelized Web Scraper for real-time RAG updates.
-    
-    Fetches raw HTML, strips noise (ads, scripts, nav), and returns 
-    clean markdown-style text for SSI state injection.
-    """
-    def __init__(self, max_workers: int = 8, timeout: int = 10) -> None:
-        self.max_workers = max_workers
-        self.timeout = timeout
-        self.headers = {
-            "User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"
-        }
-
-    def fetch_all(self, urls: List[str]) -> List[Dict[str, str]]:
-        """Parallel fetch multiple URLs for ultra-fast RAG updates."""
-        results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_url = {executor.submit(self.scrape, url): url for url in urls}
-            for future in future_to_url:
-                try:
-                    res = future.result()
-                    if res:
-                        # Convert dict to flat string for RAG if needed, 
-                        # but here we keep dict for the list return.
-                        results.append(res)
-                except Exception as e:
-                    logger.warning(f"Failed to fetch {future_to_url[future]}: {e}")
-        return results
-
-    @staticmethod
-    def scrape(url: str, timeout: int = 10) -> str:
-        """Fetch and clean a single URL, returning raw text."""
-        headers = {"User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"}
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for s in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                s.decompose()
-            
-            text = soup.get_text(separator="\n")
-            lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 30]
-            return "\n".join(lines[:100])
-        except Exception as e:
-            return f"[Scrape Error] {url}: {e}"
-        p_key, r_key = None, None
+        # 6. Fuzzy God-Mode: Weighted Scoring Pass
+        keys = [k for k in obj.keys() if isinstance(obj[k], (str, int, float))]
+        if len(keys) < 2: return None
         
-        # Heuristic: longest text is usually the response, second longest or 'question' like is prompt
-        sorted_by_len = sorted([k for k in keys if isinstance(obj[k], str)], key=lambda k: len(str(obj[k])), reverse=True)
-        
-        if not sorted_by_len: return None
-
-        # Look for indicators
-        for k in sorted_by_len:
+        scores = []
+        for k in keys:
             lk = k.lower()
-            if any(hint in lk for hint in cls._RESP_HINTS) and not r_key:
-                r_key = k
-            elif any(hint in lk for hint in cls._PROMPT_HINTS) and not p_key:
-                p_key = k
-
-        # Fallback: take longest as response, second longest as prompt if no hints found
-        if not r_key: r_key = sorted_by_len[0]
-        if not p_key and len(sorted_by_len) > 1: p_key = sorted_by_len[1]
-
-        if p_key and r_key and p_key != r_key:
-            p, r = str(obj[p_key]).strip(), str(obj[r_key]).strip()
-            # Relaxed heuristic for short-form valid data
-            if len(p) > 2 and len(r) > 1:
-                return TrainPair(prompt=p, response=r, source=source)
+            val_str = str(obj[k])
+            if len(val_str) < 2: continue
+            
+            p_score, r_score = 0, 0
+            for hint in cls._PROMPT_HINTS:
+                if hint in lk: p_score += 15 # High weight for hints
+            for hint in cls._RESP_HINTS:
+                if hint in lk: r_score += 15
+            
+            # Length bonus (longer is usually response)
+            r_score += len(val_str).bit_length()
+            scores.append({"key": k, "p": p_score, "r": r_score, "len": len(val_str)})
+            
+        if not scores: return None
+        
+        best_r = max(scores, key=lambda x: x["r"])
+        remaining = [s for s in scores if s["key"] != best_r["key"]]
+        if not remaining: return None
+        best_p = max(remaining, key=lambda x: x["p"])
+        
+        p_val, r_val = str(obj[best_p["key"]]).strip(), str(obj[best_r["key"]]).strip()
+        if len(p_val) > 2 and len(r_val) > 1:
+            return TrainPair(prompt=p_val, response=r_val, source=source)
         
         return None
 
@@ -257,7 +227,7 @@ class WebScraper:
             return ""
 
 
-def _read_jsonl(path: Path, cap_bytes: int = 50 * 1024 * 1024) -> Iterator[TrainPair]:
+def _read_jsonl(path: Path, cap_bytes: int = 500 * 1024 * 1024) -> Iterator[TrainPair]:
     """Stream pairs from a JSONL file, capped at cap_bytes to avoid OOM."""
     read_bytes = 0
     try:
@@ -395,6 +365,37 @@ def _read_xlsx(path: Path) -> Iterator[TrainPair]:
         logger.warning(f"Error reading XLSX {path}: {exc}")
 
 
+def _read_parquet(path: Path) -> Iterator[TrainPair]:
+    """Read Parquet dataset file (common in HF) using pandas/pyarrow."""
+    try:
+        import pandas as pd
+        # Read only a chunk or handle memory efficiently
+        df = pd.read_parquet(path)
+        for _, row in df.iterrows():
+            pair = _extract_pair_from_dict(row.to_dict(), source=str(path))
+            if pair:
+                yield pair
+    except ImportError:
+        logger.warning(f"pandas/pyarrow not installed. Skipping Parquet file: {path}")
+    except Exception as exc:
+        logger.warning(f"Error reading Parquet {path}: {exc}")
+
+
+def _read_arrow(path: Path) -> Iterator[TrainPair]:
+    """Read Arrow dataset file (common in HF)."""
+    try:
+        import pandas as pd
+        df = pd.read_feather(path) # Arrow files are often readable via read_feather
+        for _, row in df.iterrows():
+            pair = _extract_pair_from_dict(row.to_dict(), source=str(path))
+            if pair:
+                yield pair
+    except ImportError:
+        logger.warning(f"pandas/pyarrow not installed. Skipping Arrow file: {path}")
+    except Exception as exc:
+        logger.warning(f"Error reading Arrow {path}: {exc}")
+
+
 def _read_multimodal(path: Path) -> Iterator[TrainPair]:
     """Delegate image/audio/video to DatasetFolderReader → caption pairs."""
     try:
@@ -437,6 +438,8 @@ _EXT_READERS: dict[str, Any] = {
     ".tsv": _read_csv,
     ".xlsx": _read_xlsx,
     ".xls": _read_xlsx,
+    ".parquet": _read_parquet,
+    ".arrow": _read_arrow,
     ".png": _read_multimodal,
     ".jpg": _read_multimodal,
     ".jpeg": _read_multimodal,
@@ -486,10 +489,11 @@ def ingest_directory(
         p for p in sorted(data_dir.rglob("*"))
         if p.is_file() and p.suffix.lower() not in skip_exts and p.suffix.lower() in _EXT_READERS
     ]
+    
     if not files:
         return [], stats
 
-    stats.raw_files = len(files)
+    logger.info(f"Scanning directory for LLM data: {data_dir.name} ({len(files)} potential files found)")
 
     # Use ProcessPool for initialization stages (PDF/Log parsing is CPU bound)
     num_procs = min(multiprocessing.cpu_count(), 16)
@@ -499,10 +503,14 @@ def ingest_directory(
         # For ingestion, chunksize=1 is usually best as files vary in size
         results = list(executor.map(_ingest_worker, worker_args, chunksize=1))
 
-    for file_pairs in results:
-        raw.extend(file_pairs)
-        stats.raw_pairs += len(file_pairs)
+    for f_idx, file_pairs in enumerate(results, start=1):
+        if file_pairs:
+            f_path = files[f_idx-1]
+            logger.info(f" [{f_idx}/{len(files)}] Found {len(file_pairs):,} samples in {f_path.name}")
+            raw.extend(file_pairs)
+            stats.raw_pairs += len(file_pairs)
 
+    stats.raw_files = len(files)
     return raw, stats
 
 
@@ -856,6 +864,9 @@ def run_pipeline(
 
     if hf_dataset or kaggle_dataset:
         from neuroswift.dataset_downloader import download_from_hf, download_from_kaggle
+        # Auto-Intelligence v3.1: Remote sources deserve higher caps
+        max_pairs_per_file = max(max_pairs_per_file, 100_000)
+        
         if hf_dataset:
             sources.extend(download_from_hf(hf_dataset))
         if kaggle_dataset:

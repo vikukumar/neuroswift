@@ -309,40 +309,51 @@ class NeuroSwiftLM(nn.Module):
         top_k: int,
         top_p: float,
     ) -> Tensor:
-        if temperature <= 0.0:
-            return torch.argmax(logits, dim=-1, keepdim=True)
 
-        filtered = logits / max(temperature, 1e-5)
+        # Point 2: Improve Decoding (standard patterns)
+        # 1. Temperature scaling
+        logits = logits / max(temperature, 1e-5)
 
-        if top_k > 0 and top_k < filtered.size(-1):
-            top_values, _ = torch.topk(filtered, top_k, dim=-1)
-            kth = top_values[:, -1].unsqueeze(-1)
-            filtered = torch.where(filtered < kth, torch.full_like(filtered, float("-inf")), filtered)
+        # 2. Top-K filtering
+        if top_k > 0:
+            top_k_values, top_k_indices = torch.topk(logits, k=min(top_k, logits.size(-1)))
+            # Mask out non-Top-K tokens
+            logits = torch.where(
+                logits < top_k_values[..., -1].unsqueeze(-1),
+                torch.full_like(logits, float("-inf")),
+                logits
+            )
 
+        # 3. Top-P (Nucleus) filtering
         if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
-            cumulative = torch.cumsum(sorted_probs, dim=-1)
-            remove_mask = cumulative > top_p
-            remove_mask[:, 1:] = remove_mask[:, :-1].clone()
-            remove_mask[:, 0] = False
-            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
-            filtered = torch.full_like(filtered, float("-inf"))
-            filtered.scatter_(1, sorted_indices, sorted_logits)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift to keep the first token that exceeds top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            # Fill masked sorted_logits with -inf
+            sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
+            # Scatter back to original order
+            logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_indices, sorted_logits)
 
-        probs = torch.softmax(filtered, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
+        # 4. Final Multinomial Sampling
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        return next_token
 
     @torch.no_grad()
     def generate(
         self,
         input_ids: Tensor,
-        max_new_tokens: int = 40,
-        temperature: float = 1.0,
+        max_new_tokens: int = 64,
+        temperature: float = 0.7,
         eos_token_id: Optional[int] = None,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        repetition_penalty: float = 1.0,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.05,
         adapt_during_generation: bool = False,
         ssm_external_states: Optional[list[Optional[Tensor]]] = None,
     ) -> Tensor:

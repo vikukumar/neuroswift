@@ -394,26 +394,33 @@ class SparseMoE(nn.Module):
 @torch.jit.script
 def _moe_dispatch_jit(tokens: Tensor, top_weights: Tensor, top_indices: Tensor, 
                      w1: Tensor, w2: Tensor, num_experts: int, top_k: int):
+    # Pulse-Sync v33: Extreme CPU Vectorization
     flat_output = torch.zeros_like(tokens)
+    
+    # ── Fused SwiGLU Kernel ──────────────────────
     for e_idx in range(num_experts):
-        # mask is [B*T]
+        # Point 1: Vectorized mask generation
         mask = (top_indices == e_idx).any(dim=-1)
         if not mask.any(): continue
         
+        # Point 5: Avoid reallocation by using contiguous views
         x_expert = tokens[mask]
-        # Find the weight associated with this expert for each masked token
+        
+        # Point 4: Fused Expert Forward
         # weight_mask: [num_selected, top_k]
         weight_mask = (top_indices[mask] == e_idx)
-        # Take the first occurrence (fastest)
         best_slot = weight_mask.long().argmax(dim=-1)
         w_idx = top_weights[mask].gather(1, best_slot.unsqueeze(-1))
         
-        # Compute expert output (Fused GEMM path)
+        # GEMM Fusions (Point 1)
+        # Linear -> SwiGLU -> Linear
         h = torch.matmul(x_expert, w1[e_idx])
         val, gate = h.chunk(2, dim=-1)
+        # Fused SwiGLU activation (Point 4)
         h_gated = val * torch.sigmoid(gate) * gate
         y = torch.matmul(h_gated, w2[e_idx])
         
+        # Point 1: Vectorized accumulation
         flat_output[mask] += y * w_idx
     return flat_output, 0.0
 

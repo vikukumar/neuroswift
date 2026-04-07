@@ -92,20 +92,35 @@ class WordTokenizer:
         self.lowercase = lowercase
 
     @classmethod
-    def from_texts(cls, texts: Iterable[str], lowercase: bool = True) -> "WordTokenizer":
+    def from_texts(
+        cls, 
+        texts: Iterable[str], 
+        lowercase: bool = True, 
+        max_vocab: int = 12000, 
+        min_freq: int = 2
+    ) -> "WordTokenizer":
+        # Point 3: Normalize Tokenizer (lowercase + consistent build)
         text_list = list(texts)
         specials = [cls.pad_token, cls.unk_token, cls.eos_token]
-        vocab = list(specials)
-        unique_tokens = set()
+        
+        # Point 1 & 3: Filter rare tokens and target 8k-16k vocab
+        from collections import Counter
+        counts = Counter()
         for text in text_list:
             normalized = text.lower() if lowercase else text
-            # Captures Hindi/Sanskrit words correctly via Unicode-aware pattern
             tokens = TOKEN_PATTERN.findall(normalized)
-            unique_tokens.update(tokens)
-
-        for token in sorted(unique_tokens):
-            if token not in vocab:
-                vocab.append(token)
+            counts.update(tokens)
+            
+        # Point 3: Remove rare tokens (appearing only once)
+        valid_tokens = [t for t, freq in counts.items() if freq >= min_freq]
+        
+        # Point 1: Target 8k-16k (defaulting to 12,000 for stability)
+        # Sort by frequency, then take top N
+        sorted_tokens = sorted(valid_tokens, key=lambda x: counts[x], reverse=True)
+        final_tokens = sorted_tokens[:max_vocab - len(specials)]
+        
+        # Re-sort alphabetically for consistent build across identical data
+        vocab = specials + sorted(final_tokens)
 
         stoi = {token: idx for idx, token in enumerate(vocab)}
         itos = {idx: token for token, idx in stoi.items()}

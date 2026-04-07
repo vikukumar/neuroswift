@@ -591,12 +591,29 @@ def main() -> None:
         _rnd.seed(args.seed)
         vocab_texts = _rnd.sample(vocab_texts, 20_000)
 
-    logger.info("Building vocabulary …")
-    tokenizer = WordTokenizer.from_texts(vocab_texts)
+    logger.info("Building vocabulary (Point 1 & 3) …")
+    # Point 1: 8k-16k vocab target (12,000 default)
+    # Point 3: rare tokens removed (min_freq=2) + lowercase forced
+    tokenizer = WordTokenizer.from_texts(vocab_texts, max_vocab=12000, min_freq=2)
     logger.info(f"Vocabulary size: {tokenizer.vocab_size:,}")
 
     # ── Tensor datasets ─────────────────────────────────────────────────────
     logger.info("Tokenizing training pairs …")
+    # Point 9: Prepare contiguous datasets in RAM. 
+    train_inputs, train_labels, skipped_train = build_sft_tensors(train_pairs, tokenizer, args.seq_len)
+    train_inputs = train_inputs.contiguous()
+    train_labels = train_labels.contiguous()
+    
+    v_inputs, v_labels, skipped_val = build_sft_tensors(val_pairs, tokenizer, args.seq_len)
+    v_inputs = v_inputs.contiguous()
+    v_labels = v_labels.contiguous()
+    
+    # --- Point 2: Torch.Compile Optimization ---
+    # mode="reduce-overhead" is ideal for CPU training loops
+    # NOTE: On Windows (spawn), we compile inside the worker to avoid pickling errors.
+    if args.compile and device.type != "cpu":
+        logger.info("Auto-Optimization (GPU): Compiling model (reduce-overhead) …")
+        model = torch.compile(model, mode="reduce-overhead")
     
     # Turbo Engine v4: Force RAM Mode for CPU to eliminate SSD latency
     use_ssd = False if device.type == "cpu" else (args.use_ssd or (len(train_pairs) > 50000))
@@ -618,10 +635,7 @@ def main() -> None:
         train_inputs = Dummy()
         train_inputs.__len__ = lambda: len(train_pairs)
     else:
-        train_inputs, train_labels, skipped_train = build_sft_tensors(
-            train_pairs, tokenizer, seq_len=args.seq_len
-        )
-        logger.info(f"Training tokens: {len(train_inputs):,} examples ({skipped_train} skipped) | Mode: RAM-Master")
+        logger.info(f"Training tokens: {len(train_inputs):,} examples | Mode: RAM-Master")
         train_loader = DataLoader(
             TensorDataset(train_inputs, train_labels),
             batch_size=batch_size,
@@ -635,10 +649,8 @@ def main() -> None:
 
     has_val = len(val_pairs) > 0
     val_loader: DataLoader | None = None
-    v_inputs, v_labels = None, None  # Pulse-Sync v26: Robust Initialization
     if has_val:
-        v_inputs, v_labels, skipped_val = build_sft_tensors(val_pairs, tokenizer, seq_len=args.seq_len)
-        logger.info(f"Validation tensors: {len(v_inputs):,} examples ({skipped_val} skipped)")
+        logger.info(f"Validation tensors: {len(v_inputs):,} examples")
         if len(v_inputs) > 0:
             val_loader = DataLoader(
                 TensorDataset(v_inputs, v_labels),
@@ -720,8 +732,9 @@ def main() -> None:
     # Estimate size: Params * 4 bytes (FP32) / 1024^2 = MB
     est_size_mb = (n_params * 4) / (1024 ** 2)
     
-    total_expected_steps = len(train_pairs) // (args.batch_size) # Global potential
-    steps_per_epoch = len(train_pairs) // (args.batch_size * (8 if device.type == 'cpu' else 1))
+    total_expected_steps = len(train_inputs) // args.batch_size # Global potential
+    # Corrected alignment: Use the actual world_size (number of workers) for steps_per_epoch calculation
+    steps_per_epoch = len(train_inputs) // (args.batch_size * world_size) if world_size > 0 else len(train_inputs) // args.batch_size
     if args.max_steps_per_epoch > 0:
         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
     
@@ -783,20 +796,44 @@ def main() -> None:
 
 def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, shared_steps, shared_losses, barrier):
     # Worker Startup (Hogwild! Asynchronous Mode) ─────────────────────────────
-    # --- Pulse-Sync v32: Core-Affinity Overdrive ---
-    torch.set_num_threads(1) 
+    # --- Point 3: Dynamic Thread Allocation ---
+    cores = mp.cpu_count()
+    threads_per_worker = max(1, cores // world_size)
+    torch.set_num_threads(threads_per_worker) 
     device = torch.device(args.device if args.device else "cpu")
     torch.set_num_interop_threads(1)
     
+    # Point 5 & 6: Pre-allocate Batch Buffers EARLY for compilation warm-up
+    batch_inp = torch.zeros((args.batch_size, args.seq_len), dtype=torch.long, device=device)
+    batch_lbl = torch.zeros((args.batch_size, args.seq_len), dtype=torch.long, device=device)
+    
+    # Point 2: Sequential Compile for Windows (CPU/Spawn) stability
+    if args.compile and device.type == "cpu":
+        try:
+            for r in range(world_size):
+                if rank == r:
+                    if os.name == "nt":
+                        setup_msvc_env()
+                    model = torch.compile(model, mode="reduce-overhead")
+                    # Warm-up pass to trigger MSVC
+                    model(batch_inp)
+                barrier.wait() 
+        except Exception as e:
+            if rank == 0:
+                print(f"[NeuroSwift AutoTrain] Warning: torch.compile failed: {e}. Falling back to eager mode.")
+            barrier.wait()
+
     # Ghost-Sync Weight Sharing: Already connected to Master memory
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+    model.train()
+    
+    # Point 10: Grad Accumulation (m_size)
+    m_size = args.grad_accum
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # Turbo-Engine Configuration
     # Heartbeat suppressed per User Request (v20.1)
     
-    # Pulse-Sync v21: Buffer 16 batches before shared-memory update
-    # Balanced Performance: Restores high-fidelity convergence (Stability v21).
-    m_size = 16
+    # Pulse-Sync v21: Buffer multi batches before shared-memory update
     
     # High-Performance Data Engine: Raw Slicing (Bypasses Python DataLoader overhead)
     segment_size = len(train_inputs) // world_size
@@ -873,9 +910,11 @@ def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, 
 
             # Zero-Overhead Slicing: Directly indexing into RAM tensors
             batch_slice = local_indices[i : i + args.batch_size]
-            batch_inp = train_inputs[start_idx + batch_slice].to(device)
-            batch_lbl = train_labels[start_idx + batch_slice].to(device)
+            # Point 5 & 6: Use copy_() into preallocated buffer to avoid allocation
+            batch_inp.copy_(train_inputs[start_idx + batch_slice])
+            batch_lbl.copy_(train_labels[start_idx + batch_slice])
             
+            # Point 1 & 8: Ultra-lean forward step
             out = model(batch_inp, targets=batch_lbl)
             loss = out["loss"] / m_size
             loss.backward()

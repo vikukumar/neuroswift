@@ -38,11 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, List, Dict
 import datetime
-import multiprocessing
-
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
 
 logger = logging.getLogger(__name__)
  
@@ -157,6 +156,55 @@ class UniversalSchemaMapper:
 
         # 4. Fuzzy match pass
         keys = list(obj.keys())
+
+
+class WebScraper:
+    """
+    High-performance, parallelized Web Scraper for real-time RAG updates.
+    
+    Fetches raw HTML, strips noise (ads, scripts, nav), and returns 
+    clean markdown-style text for SSI state injection.
+    """
+    def __init__(self, max_workers: int = 8, timeout: int = 10) -> None:
+        self.max_workers = max_workers
+        self.timeout = timeout
+        self.headers = {
+            "User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"
+        }
+
+    def fetch_all(self, urls: List[str]) -> List[Dict[str, str]]:
+        """Parallel fetch multiple URLs for ultra-fast RAG updates."""
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_url = {executor.submit(self.scrape, url): url for url in urls}
+            for future in future_to_url:
+                try:
+                    res = future.result()
+                    if res:
+                        # Convert dict to flat string for RAG if needed, 
+                        # but here we keep dict for the list return.
+                        results.append(res)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {future_to_url[future]}: {e}")
+        return results
+
+    @staticmethod
+    def scrape(url: str, timeout: int = 10) -> str:
+        """Fetch and clean a single URL, returning raw text."""
+        headers = {"User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for s in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                s.decompose()
+            
+            text = soup.get_text(separator="\n")
+            lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 30]
+            return "\n".join(lines[:100])
+        except Exception as e:
+            return f"[Scrape Error] {url}: {e}"
         p_key, r_key = None, None
         
         # Heuristic: longest text is usually the response, second longest or 'question' like is prompt
@@ -185,57 +233,28 @@ class UniversalSchemaMapper:
         return None
 
 
-class WebScraper:
-    """
-    High-performance, parallelized Web Scraper for real-time RAG updates.
-    
-    Fetches raw HTML, strips noise (ads, scripts, nav), and returns 
-    clean markdown-style text for SSI state injection.
-    """
-    def __init__(self, max_workers: int = 8, timeout: int = 10) -> None:
-        self.max_workers = max_workers
-        self.timeout = timeout
-        self.headers = {
-            "User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"
-        }
-
-    def fetch_all(self, urls: List[str]) -> List[Dict[str, str]]:
-        """Parallel fetch multiple URLs for ultra-fast RAG updates."""
-        results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_url = {executor.submit(self.scrape, url, self.timeout): url for url in urls}
-            for future in future_to_url:
-                try:
-                    res = future.result()
-                    if res:
-                        results.append({"url": future_to_url[future], "content": res})
-                except Exception as e:
-                    logger.warning(f"Failed to fetch {future_to_url[future]}: {e}")
-        return results
-
-    @staticmethod
-    def scrape(url: str, timeout: int = 10) -> str:
-        """Fetch and clean a single URL, returning raw text."""
-        headers = {"User-Agent": "NeuroSwift-Bot/1.2.0 (Alpha; AI-Research)"}
-        try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for s in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                s.decompose()
-            
-            text = soup.get_text(separator="\n")
-            lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 30]
-            return "\n".join(lines[:100])
-        except Exception as e:
-            logger.debug(f"Scrape failed for {url}: {e}")
-            return ""
-
-
 def _extract_pair_from_dict(obj: dict[str, Any], source: str = "") -> TrainPair | None:
     """Delegates to UniversalSchemaMapper."""
     return UniversalSchemaMapper.map_obj(obj, source=source)
+
+
+class WebScraper:
+    """Simple inbuilt web scraper for URL ingestion."""
+    @staticmethod
+    def scrape(url: str) -> str:
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Remove scripts/styles
+            for script in soup(["script", "style"]):
+                script.decompose()
+            return soup.get_text(separator=" ", strip=True)
+        except Exception as e:
+            logger.debug(f"Scrape failed for {url}: {e}")
+            return ""
 
 
 def _read_jsonl(path: Path, cap_bytes: int = 50 * 1024 * 1024) -> Iterator[TrainPair]:

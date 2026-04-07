@@ -837,8 +837,7 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
     
-    steps_per_epoch = len(train_loader) // m_size
-    total_steps = steps_per_epoch * args.epochs
+    # Aero-Turbo v42: Consolidating progress metadata
 
     # Aero-Turbo v36: Process Synchronization
     # Ensure all processes have completed VRAM migration before timing
@@ -939,7 +938,7 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 if n_steps % 250 == 0:
                     gc.collect()
             
-            prefetcher.stop_event.set()
+            # Direct-VRAM Drive (No prefetcher to stop)
             avg_loss = epoch_loss / max(n_steps, 1)
             
             # Parallel Validation: All ranks participate to eliminate stalls

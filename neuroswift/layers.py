@@ -414,6 +414,7 @@ class SparseMoE(nn.Module):
         # Filtering changes the tensor SHAPE, which causes CheckpointError (Metadata Mismatch).
         # Fix: We use the valid_mask to zero out weights of tokens that exceed capacity.
         # This keeps the shape of all tensors identical between forward/backward passes.
+        valid_mask = pos_in_expert < capacity
         assigned_weights = assigned_weights * valid_mask.to(assigned_weights.dtype)
         
         # Scatter active tokens to the batched expert tensor

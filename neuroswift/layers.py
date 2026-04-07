@@ -417,16 +417,21 @@ class SparseMoE(nn.Module):
         valid_mask = pos_in_expert < capacity
         assigned_weights = assigned_weights * valid_mask.to(assigned_weights.dtype)
         
+        # Aero-Turbo v36: Absolute Safe Scattering
+        # Even with masking, we must clamp indices to [0, capacity-1] to prevent IndexError
+        # when a token is routed to an expert that is already at full capacity.
+        # The zeroed weights (above) ensure these dummy assignments don't affect training.
+        safe_pos = torch.where(valid_mask, pos_in_expert, 0)
+        
         # Scatter active tokens to the batched expert tensor
-        # This uses the full potential capacity, ensuring constant-sized tensors.
-        x_batched[assigned_experts, pos_in_expert] = tokens[assigned_tokens]
+        x_batched[assigned_experts, safe_pos] = tokens[assigned_tokens]
         
         # Fused Expert Forward Pass (One large BMM)
         # self.expert_engine performs: val, gate = (x @ W1).chunk(2); h = val * silu(gate); out = h @ W2
         expert_output_batched = self.expert_engine(x_batched, torch.arange(self.num_experts, device=x.device))
         
         # Gather back to flat_output with weights
-        expert_outputs_subset = expert_output_batched[assigned_experts, pos_in_expert]
+        expert_outputs_subset = expert_output_batched[assigned_experts, safe_pos]
         flat_output.index_add_(0, assigned_tokens, expert_outputs_subset * assigned_weights.unsqueeze(-1))
 
         # Optimized Aux-loss returned

@@ -834,6 +834,11 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     steps_per_epoch = len(train_loader) // m_size
     total_steps = steps_per_epoch * args.epochs
 
+    # Aero-Turbo v36: Process Synchronization
+    # Ensure all processes have completed VRAM migration before timing
+    if dist.is_initialized():
+        dist.barrier()
+        
     global_step = 0
     best_val_loss = float("inf")
     ema_loss = None
@@ -937,11 +942,15 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     except Exception as e:
         if rank == 0:
             logger.error(f"Distributed Engine Crash: {e}")
-            # Safe Emergency Checkpoint
-            if 'model' in locals():
-                # Correct un-wrapping of DistributedDataParallel (v35 Shield)
-                raw_mod = model.module if hasattr(model, "module") else model
-                _save_checkpoint(raw_mod, tokenizer, args.output_dir / "crash_recovery", 0.0)
+            # Aero-Turbo v36: Ultra-Safe Emergency Checkpoint
+            try:
+                # Check for model in either wrapper or raw form
+                m = locals().get('model')
+                if m is not None:
+                    raw_mod = m.module if hasattr(m, "module") else m
+                    _save_checkpoint(raw_mod, tokenizer, args.output_dir / "crash_recovery", 0.0)
+            except Exception as save_err:
+                logger.error(f"Failed to save emergency checkpoint: {save_err}")
         raise e
         gc.enable()
 

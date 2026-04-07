@@ -861,6 +861,8 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
             train_sampler.set_epoch(epoch)
             epoch_loss = 0.0
             n_steps = 0
+            # Aero-Turbo v43: Zero-Sync Accumulator
+            accum_loss = torch.zeros(1, device=device)
             v_prefetcher = None
             
             # ── Direct-VRAM Drive v34: Zero-Overhead Slicing ──────────────────────
@@ -905,20 +907,23 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 scaler.step(optimizer)
                 scaler.update()
                 
-                current_loss_val = loss.item()
-                if ema_loss is None:
-                    ema_loss = current_loss_val
-                else:
-                    ema_loss = 0.9 * ema_loss + 0.1 * current_loss_val
-
+                # Aero-Turbo v43: Zero-Sync detached accumulation (kills the per-step sync bottleneck)
+                accum_loss += loss.detach()
                 global_step += 1
                 n_steps += 1
-                epoch_loss += current_loss_val
 
                 # Aero-Turbo v37: High-Fidelity Logging (Requested By User)
                 # Display log for each 50 step completion
                 if rank == 0 and global_step % 50 == 0:
                     torch.cuda.synchronize() # Barrier for accurate performance profiling
+                    
+                    # Aero-Turbo v43: Windowed sync (Move loss to CPU only once per 50 steps)
+                    current_window_loss = accum_loss.item() / 50
+                    accum_loss.zero_()
+                    if ema_loss is None: ema_loss = current_window_loss
+                    else: ema_loss = 0.9 * ema_loss + 0.1 * current_window_loss
+                    epoch_loss += (current_window_loss * 50)
+                    
                     step_end_time = time.time()
                     elapsed = step_end_time - step_start_time
                     # steps/sec calculation for the 50-step window
@@ -929,11 +934,15 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                         f"Epoch: {epoch}/{args.epochs} | "
                         f"Step: {global_step}/{total_steps} | "
                         f"Loss: {ema_loss:.4f} | "
-                        f"{steps_per_sec:.1f} stp/s | "
+                        f"{steps_per_sec:.1f} steps/sec | "
                         f"VRAM: {vram:.2f}GB"
                     )
                     # Reset timer for next 50-step window
                     step_start_time = time.time()
+                
+                # Aero-Turbo v43: Epoch Capping (Requested by User)
+                if n_steps >= 2000:
+                    break
                 
                 if n_steps % 250 == 0:
                     gc.collect()

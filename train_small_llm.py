@@ -652,14 +652,14 @@ def main() -> None:
 
     num_physical_gpus = torch.cuda.device_count()
     
-    # Aero-Turbo v44: Prime Reactor (Single-GPU Bypass)
+    # Aero-Turbo v46: Reactor Core Re-Balancing (Batch 8)
     if device.type == "cuda" and num_physical_gpus == 1:
         world_size = 1
         backend = "gloo" # Not used but kept for metadata
         logger.info("[PRIME-REACTOR] Single GPU detected. Bypassing DDP for raw hardware speed.")
         
-        # Increase batch size for better 1-GPU saturation
-        args.batch_size = 16 
+        # Recalibrate Batch size (8 is the sweet spot for 15GB / 384-dim)
+        args.batch_size = 8 
         
         # Execute train_worker directly in master process
         try:

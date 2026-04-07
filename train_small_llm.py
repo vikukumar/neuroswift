@@ -531,7 +531,11 @@ def main() -> None:
     tokenizer = WordTokenizer.from_texts(vocab_texts)
     logger.info(f"Vocabulary size: {tokenizer.vocab_size:,}")
 
-    # ── Tensor datasets ─────────────────────────────────────────────────────
+    # Aero-Turbo v38: Hyper-Swift Pulse (Hardware Acceleration)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    
+    # ── Aero-Intelligence Data Prep ───────────────────────────────────────────
     logger.info("Tokenizing training pairs …")
     
     # Turbo Engine v4: Force RAM Mode for CPU to eliminate SSD latency
@@ -650,20 +654,23 @@ def main() -> None:
         num_physical_gpus = torch.cuda.device_count()
         # Intelligent Backend Selection
         if num_physical_gpus == 1:
-            # NCCL does not support multiple ranks on a single GPU.
-            # Using GLOO for stable over-subscription on single-GPU hardware.
-            world_size = 2 
-            backend = "gloo"
+            # Aero-Turbo v38: Aggressive Speed Tuning
+            # Target higher VRAM utilization since user has 15GB
+            # Checkpointing is OFF by default for speed; it only enables if batch size defaults are too large.
+            checkpointing = False
+            if total_vram > 0:
+                # If model size + buffers > 80% of shard, enable checkpointing to stay safe
+                if model_mem_gb > (shard_vram * 0.8):
+                    checkpointing = True
+                    logger.info("[OOM-SHIELD] High memory pressure detected. Checkpointing: ON")
+                else:
+                    logger.info("[OOM-SHIELD] Sufficient VRAM detected. Speed Mode: Checkpointing OFF")
             
-            # Aero-Turbo v32: OOM Shield for single-GPU over-subscription
-            # We MUST enable grad checkpointing to fit two processes on one device.
-            # We also cap batch size to 2 to prevent activation OOM.
-            args.grad_checkpoint = True
-            if args.batch_size > 2:
-                logger.info(f"[OOM-SHIELD] Reducing batch size {args.batch_size} -> 2 for 2-process GPU-sharing stability.")
-                args.batch_size = 2
-                
-            logger.info("[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to GLOO + OOM-Shield (Checkpointing=ON, Batch=2).")
+            # Switch to GLOO for single-GPU over-subscription stability
+            # GLOO is used because NCCL doesn't support multiple processes sharing a single device well.
+            backend = "gloo" 
+            args.grad_checkpoint = checkpointing
+            logger.info(f"[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to {backend.upper()} + OOM-Shield (CKPT={checkpointing}, Batch={m_size}).")
         else:
             # Professional NCCL for multi-GPU clusters
             world_size = num_physical_gpus 
@@ -733,12 +740,12 @@ class BackgroundPrefetcher:
         return batch
 
 def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, d_model, n_layers):
-    # Aero-Turbo v32: Absolute Sync Protection
-    # Explicitly clear cache to prevent OOM fragmentation on startup
+    # Aero-Turbo v39: Absolute Pulse (Hardware acceleration)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Set memory fraction to 0.45 (Total 0.90) to ensure a stable buffer
         torch.cuda.set_per_process_memory_fraction(0.45) 
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
         
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
@@ -797,16 +804,12 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         except: pass
 
     if world_size > 1:
+        # Aero-Turbo v39: Consolidated Single DDP Init
         ddp_device_id = [rank % torch.cuda.device_count()] if backend == "nccl" else None
         model = DDP(model, device_ids=ddp_device_id, find_unused_parameters=True)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
-    
-    # Set aggregation: m_size=1 for maximum 'Steps/s' (Hitting 200+ objective)
-    m_size = 10 if backend == "gloo" else 1
-    if backend == "nccl":
-        torch.backends.cudnn.benchmark = True
     
     # Dataset Sharding
     train_dataset = TensorDataset(train_inputs, train_labels)
@@ -822,14 +825,6 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
         val_dataset = TensorDataset(v_inputs, v_labels)
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=0)
-
-        # Aero-Intelligence v30: NCCL requires device_ids, GLOO requires None for single-GPU stability
-        # Mapping ranks to physical device IDs
-        ddp_device_id = [rank % torch.cuda.device_count()] if backend == "nccl" else None
-        model = DDP(model, device_ids=ddp_device_id, find_unused_parameters=True)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     
     steps_per_epoch = len(train_loader) // m_size
     total_steps = steps_per_epoch * args.epochs
@@ -839,6 +834,10 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
     if dist.is_initialized():
         dist.barrier()
         
+    # Aero-Turbo v40: Pulse Integrity
+    # Calculate total steps across all epochs using the full dataset size
+    num_batches = len(train_inputs) // (args.batch_size * world_size)
+    total_steps = num_batches * args.epochs
     global_step = 0
     best_val_loss = float("inf")
     ema_loss = None
@@ -906,14 +905,24 @@ def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs
                 n_steps += 1
                 epoch_loss += current_loss_val
 
-                if rank == 0 and global_step % 1 == 0:
+                # Aero-Turbo v37: High-Fidelity Logging (Requested By User)
+                # Display log for each 50 step completion
+                if rank == 0 and global_step % 50 == 0:
                     torch.cuda.synchronize() # Barrier for accurate performance profiling
-                    dt = time.time() - step_start_time
-                    sps = world_size / max(dt, 1e-6)
-                    # Aero-Turbo v35: Displaying total global steps as requested
+                    step_end_time = time.time()
+                    elapsed = step_end_time - step_start_time
+                    # steps/sec calculation for the 50-step window
+                    steps_per_sec = 50 / elapsed if elapsed > 0 else 0
+                    
+                    vram = torch.cuda.memory_reserved() / 1e9
                     logger.info(
-                        f"Step: {batch_idx//args.batch_size} | Global: {global_step * world_size} | Loss: {ema_loss:.4f} | {sps:.1f} smp/s | VRAM: {torch.cuda.memory_allocated()/1e9:.2f}GB"
+                        f"Epoch: {epoch}/{args.epochs} | "
+                        f"Step: {global_step}/{total_steps} | "
+                        f"Loss: {ema_loss:.4f} | "
+                        f"{steps_per_sec:.1f} stp/s | "
+                        f"VRAM: {vram:.2f}GB"
                     )
+                    # Reset timer for next 50-step window
                     step_start_time = time.time()
                 
                 if n_steps % 250 == 0:

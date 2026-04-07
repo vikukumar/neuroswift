@@ -747,10 +747,12 @@ class BackgroundPrefetcher:
         return batch
 
 def train_worker(rank, world_size, backend, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, d_model, n_layers):
-    # Aero-Turbo v39: Absolute Pulse (Hardware acceleration)
+    # Aero-Turbo v45: Reactor Core Expansion
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.set_per_process_memory_fraction(0.45) 
+        # Prime Reactor (world_size=1) gets 90% of VRAM; Distributed (world_size>1) gets 45% per rank
+        mem_fraction = 0.90 if world_size == 1 else 0.45
+        torch.cuda.set_per_process_memory_fraction(mem_fraction) 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         

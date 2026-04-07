@@ -43,7 +43,7 @@ class NeuroSwiftConfig:
     top_k: int = 2
     expert_hidden: int = 256
     plastic_dim: int = 48
-    dropout: float = 0.15
+    dropout: float = 0.1
     emb_dropout: float = 0.05
     aux_loss_scale: float = 1e-2
     attn_interval: int = 0  # Reverted default to protection legacy models
@@ -52,7 +52,7 @@ class NeuroSwiftConfig:
     
     # NeuroSwift v1 Features
     version: str = "v1"
-    label_smoothing: float = 0.0
+    label_smoothing: float = 0.05  # Enabled by default in v29
     adaptive_dropout: bool = False
     stability_module: bool = False
     dynamic_top_k: bool = True
@@ -77,9 +77,7 @@ class NeuroSwiftConfig:
         if "version" not in normalized:
             normalized["version"] = "v0"
         if "label_smoothing" not in normalized:
-            normalized["label_smoothing"] = 0.05
-        if "emb_dropout" not in normalized:
-            normalized["emb_dropout"] = 0.05
+            normalized["label_smoothing"] = 0.0
         if "adaptive_dropout" not in normalized:
             normalized["adaptive_dropout"] = False
         if "stability_module" not in normalized:
@@ -190,21 +188,6 @@ class NeuroSwiftLM(nn.Module):
 
         self.apply(self._init_weights)
 
-    def num_parameters(self, only_trainable: bool = True) -> int:
-        """Returns total or trainable parameter count."""
-        if only_trainable:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return sum(p.numel() for p in self.parameters())
-
-    def num_parameters_formatted(self) -> str:
-        """Returns scale-aware parameter string (e.g. 1.2M, 850K)."""
-        count = self.num_parameters()
-        if count >= 1_000_000:
-            return f"{count / 1_000_000:.1f}M"
-        elif count >= 1_000:
-            return f"{count / 1_000:.1f}K"
-        return str(count)
-
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             # Omega-Mode Stability: Kaiming Normal for 1M models
@@ -292,26 +275,14 @@ class NeuroSwiftLM(nn.Module):
         }
 
         if targets is not None:
-            # Standard next-token CE loss
-            ce_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
-                label_smoothing=self.config.label_smoothing
-            )
+            # v29: Add Label Smoothing to prevent memorization collapse
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            targets_flat = targets.reshape(-1)
+            ls = getattr(self.config, "label_smoothing", 0.05)
+            loss = F.cross_entropy(logits_flat, targets_flat, label_smoothing=ls)
             
-            # Multi-Token Prediction (MTP) Loss - Disabled for 30 steps/sec Hyperdrive
-            mtp_loss = 0.0
-            # mtp_logits = self.mtp_head(x).float()
-            # out["mtp_logits"] = mtp_logits
-            # if targets.size(1) > 1:
-            #     mtp_targets = targets[:, 1:]
-            #     mtp_loss = F.cross_entropy(
-            #         mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
-            #         mtp_targets.reshape(-1)
-            #     )
-            
-            # Combined Loss: Standard + 0.1*MTP + Aux (Titan v10 Stability)
-            out["loss"] = ce_loss + 0.1 * mtp_loss + self.config.aux_loss_scale * aux_loss
+            # v29: Combined Loss with MoE aux (MTP disabled for CPU speed)
+            out["loss"] = loss + (self.config.aux_loss_scale * aux_loss)
 
         return out
 
@@ -419,8 +390,6 @@ class NeuroSwiftLM(nn.Module):
         save_dir.mkdir(parents=True, exist_ok=True)
 
         config_dict = self.config.to_dict()
-        config_dict["parameter_count"] = self.num_parameters_formatted()
-        
         (save_dir / "config.json").write_text(
             json.dumps(config_dict, indent=2),
             encoding="utf-8",

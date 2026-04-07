@@ -379,54 +379,43 @@ class SparseMoE(nn.Module):
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
 
-        # 3. Expert-Sparse Pulse Dispatch (Expert Engine v16)
-        # Breakthrough: Reduces FLOPs by 4x by only computing active experts.
-        # Zero-Waste Architecture: Reduced memory pressure via direct indexing.
+        # 3. Expert-Sparse Pulse Dispatch (Neural Engine v32: Temporal Overdrive)
+        # Extreme CPU Optimization: Fusing dispatch and expert computation via JIT
         tokens = x.view(-1, d_model)
-        flat_output = torch.zeros_like(tokens)
-        
-        # 3. Expert-Sparse Pulse Dispatch (Expert Engine v19)
-        # Breakthrough: Pre-Sorted Pulse. 
-        # Groups tokens by expert using a single sort, allowing contiguous slicing.
-        # This eliminates high-overhead 'where' and 'mask' calls.
-        flat_top_idx = top_indices.view(-1)
-        sorted_indices = torch.argsort(flat_top_idx)
-        sorted_top_idx = flat_top_idx[sorted_indices]
-        
-        # Calculate expert boundaries
-        expert_counts = torch.bincount(sorted_top_idx, minlength=self.num_experts)
-        expert_offsets = torch.cumsum(expert_counts, dim=0) - expert_counts
-        
-        tokens = x.reshape(-1, d_model)
-        flat_output = torch.zeros_like(tokens)
-        
-        # Expert Cluster Loop
-        for e_idx in range(self.num_experts):
-            count = expert_counts[e_idx].item()
-            if count == 0: continue
-            
-            offset = expert_offsets[e_idx].item()
-            # map_indices: which original tokens (and which K slot) relate to this expert
-            map_indices = sorted_indices[offset : offset + count]
-            token_indices = map_indices // active_top_k
-            k_indices = map_indices % active_top_k
-            
-            # Zero-Copy Slice & Compute
-            x_expert = tokens[token_indices]
-            w_expert = top_weights.view(-1, active_top_k)[token_indices, k_indices].unsqueeze(-1)
-            
-            h = x_expert @ self.expert_engine.w1[e_idx]
-            val, gate = h.chunk(2, dim=-1)
-            h_gated = val * torch.sigmoid(gate) * gate
-            y = h_gated @ self.expert_engine.w2[e_idx]
-            
-            flat_output.index_add_(0, token_indices, y * w_expert)
+        out, aux_loss_val = _moe_dispatch_jit(
+            tokens, top_weights, top_indices, 
+            self.expert_engine.w1, self.expert_engine.w2, 
+            self.num_experts, active_top_k
+        )
+        # Final addition: merge the expert outputs with the residual stream
+        out = residual + self.dropout(out.view(batch, seq_len, d_model))
+        return out, aux_loss if self.training else torch.tensor(0.0, device=x.device)
 
-        out = residual + self.dropout(flat_output.view(batch, seq_len, d_model))
-        return out, aux_loss
-
-        out = residual + self.dropout(flat_output.view(batch, seq_len, d_model))
-        return out, aux_loss
+@torch.jit.script
+def _moe_dispatch_jit(tokens: Tensor, top_weights: Tensor, top_indices: Tensor, 
+                     w1: Tensor, w2: Tensor, num_experts: int, top_k: int):
+    flat_output = torch.zeros_like(tokens)
+    for e_idx in range(num_experts):
+        # mask is [B*T]
+        mask = (top_indices == e_idx).any(dim=-1)
+        if not mask.any(): continue
+        
+        x_expert = tokens[mask]
+        # Find the weight associated with this expert for each masked token
+        # weight_mask: [num_selected, top_k]
+        weight_mask = (top_indices[mask] == e_idx)
+        # Take the first occurrence (fastest)
+        best_slot = weight_mask.long().argmax(dim=-1)
+        w_idx = top_weights[mask].gather(1, best_slot.unsqueeze(-1))
+        
+        # Compute expert output (Fused GEMM path)
+        h = torch.matmul(x_expert, w1[e_idx])
+        val, gate = h.chunk(2, dim=-1)
+        h_gated = val * torch.sigmoid(gate) * gate
+        y = torch.matmul(h_gated, w2[e_idx])
+        
+        flat_output[mask] += y * w_idx
+    return flat_output, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -609,20 +598,38 @@ class MLALinearAttention(nn.Module):
         k = (F.elu(k) + 1).view(B, T, self.n_heads, self.head_dim)
         v = v.view(B, T, self.n_heads, self.head_dim)
         
-        # Causal Duality Expand: Q @ Sum(K.T @ V)
-        kv_prod = torch.einsum("bthd,bthm->bthdm", k, v)
-        if state is not None:
-             kv_causal = torch.cumsum(kv_prod, dim=1) + state.unsqueeze(1)
-             z_causal = torch.cumsum(k, dim=1) + state.mean().abs() # Heuristic for den
-        else:
-             kv_causal = torch.cumsum(kv_prod, dim=1)
-             z_causal = torch.cumsum(k, dim=1)
-            
-        num = torch.einsum("bthd,bthdm->bthm", q, kv_causal)
-        den = torch.einsum("bthd,bthd->bth", q, z_causal).unsqueeze(-1)
-        
-        out = (num / (den + 1e-9)).reshape(B, T, D)
-        return x + self.dropout(self.out_proj(out)), kv_causal[:, -1]
+        # Pulse-Sync v31: Neural Fusion (JIT-Accelerated)
+        out, last_state = _mla_compute_jit(q, k, v, x, self.out_proj.weight, self.out_proj.bias, state)
+        return x + self.dropout(out), last_state
+
+@torch.jit.script
+def _mla_compute_jit(q, k, v, x, out_w, out_b, state: Optional[Tensor] = None):
+    B, T, H, hd = q.shape
+    D = x.shape[-1]
+    
+    # Causal Duality Expand: Q @ Sum(K.T @ V)
+    # Using explicit view/matmul for JIT compatibility and CPU speed
+    # k: [B, T, H, hd], v: [B, T, H, hd]
+    # Fusing K/V into state
+    kv_prod = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2)) # [B, T, H, hd, hd]
+    
+    if state is not None:
+        kv_causal = torch.cumsum(kv_prod, dim=1) + state.unsqueeze(1)
+        z_causal = torch.cumsum(k, dim=1) + state.mean().abs().clamp_min(1e-4)
+    else:
+        kv_causal = torch.cumsum(kv_prod, dim=1)
+        z_causal = torch.cumsum(k, dim=1)
+    
+    # num: [B, T, H, hd]
+    num = torch.matmul(q.unsqueeze(-2), kv_causal).squeeze(-2)
+    # den: [B, T, H, 1]
+    den = torch.sum(q * z_causal, dim=-1, keepdim=True)
+    
+    y = num / (den + 1e-9)
+    y_flat = y.reshape(B * T, -1)
+    out = F.linear(y_flat, out_w, out_b).view(B, T, D)
+    
+    return out, kv_causal[:, -1]
 
 
 class DynamicDepthGate(nn.Module):

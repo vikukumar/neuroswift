@@ -652,22 +652,31 @@ def main() -> None:
 
     if device.type == "cuda":
         num_physical_gpus = torch.cuda.device_count()
+        total_vram = torch.cuda.get_device_properties(0).total_memory if num_physical_gpus > 0 else 0
+        shard_vram = total_vram / 2 # Assuming 2 processes for single-GPU over-subscription
+        
+        # Estimate model footprint (v41 Shield)
+        # Layers * d_model * expert_hidden * bytes_per_param (4 for FP32)
+        param_est = n_layers_arg * d_model_arg * (d_model_arg * 2) * args.num_experts * 4
+        model_mem_gb = param_est / 1e9
+        
         # Intelligent Backend Selection
         if num_physical_gpus == 1:
-            # Aero-Turbo v38: Aggressive Speed Tuning
+            # Aero-Turbo v41: Aggressive Speed Tuning
             # Target higher VRAM utilization since user has 15GB
-            # Checkpointing is OFF by default for speed; it only enables if batch size defaults are too large.
+            world_size = 2
             checkpointing = False
+            m_size = args.batch_size # Base batch size for logging
+            
             if total_vram > 0:
                 # If model size + buffers > 80% of shard, enable checkpointing to stay safe
-                if model_mem_gb > (shard_vram * 0.8):
+                if model_mem_gb > (shard_vram / 1e9 * 0.8):
                     checkpointing = True
                     logger.info("[OOM-SHIELD] High memory pressure detected. Checkpointing: ON")
                 else:
                     logger.info("[OOM-SHIELD] Sufficient VRAM detected. Speed Mode: Checkpointing OFF")
             
             # Switch to GLOO for single-GPU over-subscription stability
-            # GLOO is used because NCCL doesn't support multiple processes sharing a single device well.
             backend = "gloo" 
             args.grad_checkpoint = checkpointing
             logger.info(f"[AERO-INTELLIGENCE] Single GPU Over-subscription: Switching to {backend.upper()} + OOM-Shield (CKPT={checkpointing}, Batch={m_size}).")
@@ -675,9 +684,11 @@ def main() -> None:
             # Professional NCCL for multi-GPU clusters
             world_size = num_physical_gpus 
             backend = "nccl"
+            m_size = args.batch_size
     else:
         world_size = 10 
         backend = "gloo"
+        m_size = args.batch_size
 
     logger.info(f"Master: Launching {world_size} Absolute Engine Processes ({backend})...")
     

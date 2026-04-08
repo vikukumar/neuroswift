@@ -300,9 +300,9 @@ Examples:
         help="Folder to auto-scan for ALL supported file types (JSONL, JSON, TXT, "
              "CSV, XLSX, PNG, WAV, MP4 …). Takes priority over --data-path.",
     )
-    data_grp.add_argument("--max-examples", type=int, default=50_000,
+    data_grp.add_argument("--max-examples", type=int, default=0,
                           help="Max training pairs after pipeline (0=unlimited).")
-    data_grp.add_argument("--max-per-file", type=int, default=10_000,
+    data_grp.add_argument("--max-per-file", type=int, default=10_000_000_000,
                           help="Max pairs extracted from any single file.")
     data_grp.add_argument("--min-prompt-words", type=int, default=2)
     data_grp.add_argument("--max-prompt-words", type=int, default=512)
@@ -334,7 +334,7 @@ Examples:
     train_grp.add_argument("--grad-accum", type=int, default=1,
                            help="Gradient accumulation steps (effective_bs = batch × accum).")
     train_grp.add_argument("--seq-len", type=int, default=32, help="Sequence length (Pulse-Stream: 32 for 100+ steps/s)")
-    p.add_argument("--lr", type=float, default=0.0098) # v22: Ultra-High LR for <0.2 Loss
+    p.add_argument("--lr", type=float, default=0.0003) # v22: Ultra-High LR for <0.2 Loss
     train_grp.add_argument("--min-lr-ratio", type=float, default=0.05,
                            help="Minimum LR as a fraction of peak LR (cosine schedule).")
     train_grp.add_argument("--warmup-ratio", type=float, default=0.1,
@@ -394,7 +394,7 @@ def auto_model_size(n_train: int, device: torch.device) -> tuple[int, int]:
     if device.type == "cpu":
         # Global Optimization v23: Reasoning enabled via attn_interval=1
         # 1-layer + Attention = ~3.8M parameters.
-        return 168, 1
+        return 192, 4
     else:  # GPU
         if n_train < 2_000:
             return 192, 4
@@ -486,7 +486,7 @@ def main() -> None:
         torch.set_flush_denormal(True)
         # Using 8 processes, each with 1 OMP thread = Full P-Core saturation
         torch.set_num_threads(1) 
-        logger.info(f"Auto-Optimization (CPU): Saturation v21 Active | 8 Workers Spawning...")
+        logger.info(f"Auto-Optimization (CPU): Saturation Active | 8 Workers Spawning...")
     elif device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         if torch.cuda.get_device_capability()[0] >= 8:
@@ -500,7 +500,7 @@ def main() -> None:
     else:
         batch_size = args.batch_size
     
-    logger.info(f"Device: {device}  |  Batch size (V20): {batch_size}")
+    logger.info(f"Device: {device}  |  Batch size : {batch_size}")
     args.batch_size = batch_size # Sync back to args for distributed launch
 
     # ── CPU Hyper-Breakthrough (100+ steps/s) ──────────────────────────────
@@ -687,7 +687,7 @@ def main() -> None:
             plastic_dim=auto_plastic_dim,
             dropout=args.dropout,
             aux_loss_scale=1e-2,
-            attn_interval=1, # v23: Enabled for reasoning Ability
+            attn_interval=4, # v23: Enabled for reasoning Ability
             ternary_mode=False, 
             latent_dim=args.latent_dim,
         )
@@ -705,7 +705,9 @@ def main() -> None:
     
     print(f"{_get_stamp()}  Training Plan: {args.epochs} Epochs | {steps_per_epoch} Steps/Epoch")
     print(f"{_get_stamp()}  Model Intelligence: {n_params:,} Parameters | ~{est_size_mb:.2f} MB on disk")
-    print(f"{_get_stamp()}  Reasoning: Multi-Head Linear Attention ACTIVE (attn_interval=1)")
+    print(f"{_get_stamp()}  Reasoning: Multi-Head Linear Attention ACTIVE (attn_interval={config.attn_interval})")
+    print(f"{_get_stamp()}  Vocabulary size: {tokenizer.vocab_size:,} tokens")
+    print(f"{_get_stamp()}  Model Config: {model.config}")
 
     # ── Optimizer + scheduler ───────────────────────────────────────────────
     # Separate weight-decay from bias/norm params
@@ -724,7 +726,7 @@ def main() -> None:
     # --- NeuroSwift Turbo-Engine 2.0: Asynchronous Hogwild Launch ---
     # --- NeuroSwift Saturation 2.1: Optimized Rank Affinity ---
     # world_size = 8: Focuses on 100% P-Core saturation, avoiding E-Core slowdowns.
-    world_size = 8 if device.type == "cpu" else 1
+    world_size = 12 if device.type == "cpu" else 1
     if device.type == "cpu":
         # ── Zero-Copy Shared Memory (Mandatory for Windows/mp.spawn) ────────────
         train_inputs.share_memory_()
@@ -735,8 +737,11 @@ def main() -> None:
             
         # Model Parameters Sharing
         model.share_memory()
+
+        print(f"{_get_stamp()}  Master: Launching {world_size} ASYNC processes (Zero-Barrier Hogwild)...")
         
         logger.info(f"Master: Launching {world_size} ASYNC processes (Zero-Barrier Hogwild)...")
+
         # Shared Optimization Context: Absolute Lock-Free
         shared_steps = mp.RawArray('i', world_size)
         shared_loss = mp.RawArray('f', world_size)
@@ -757,8 +762,8 @@ def main() -> None:
 def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, shared_steps, shared_losses, barrier):
     # Worker Startup (Hogwild! Asynchronous Mode) ─────────────────────────────
     device = torch.device("cpu")
-    torch.set_num_threads(1) 
-    torch.set_num_interop_threads(1)
+    torch.set_num_threads(2) 
+    torch.set_num_interop_threads(2)
     
     # Ghost-Sync Weight Sharing: Already connected to Master memory
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
@@ -850,8 +855,8 @@ def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, 
                             f"Loss: {shared_losses[rank]:.4f}")
                             
                 print(log_line, flush=True)
-                with open("artifacts/throughput.log", "a") as f:
-                    f.write(log_line)
+                # with open("artifacts/throughput.log", "a") as f:
+                #     f.write(log_line)
                 
                 prev_cluster_steps = curr_total_steps
                 step_start_time = current_time

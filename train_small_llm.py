@@ -300,14 +300,14 @@ Examples:
         help="Folder to auto-scan for ALL supported file types (JSONL, JSON, TXT, "
              "CSV, XLSX, PNG, WAV, MP4 …). Takes priority over --data-path.",
     )
-    data_grp.add_argument("--max-examples", type=int, default=1_000_000,
+    data_grp.add_argument("--max-examples", type=int, default=50_000,
                           help="Max training pairs after pipeline (0=unlimited).")
-    data_grp.add_argument("--max-per-file", type=int, default=1_000_000,
+    data_grp.add_argument("--max-per-file", type=int, default=10_000,
                           help="Max pairs extracted from any single file.")
     data_grp.add_argument("--min-prompt-words", type=int, default=2)
-    data_grp.add_argument("--max-prompt-words", type=int, default=2048)
+    data_grp.add_argument("--max-prompt-words", type=int, default=512)
     data_grp.add_argument("--min-response-words", type=int, default=3)
-    data_grp.add_argument("--max-response-words", type=int, default=5000)
+    data_grp.add_argument("--max-response-words", type=int, default=600)
     data_grp.add_argument("--val-fraction", type=float, default=0.05,
                           help="Fraction of pairs held out for validation.")
     data_grp.add_argument("--no-dedup", action="store_true",
@@ -334,9 +334,8 @@ Examples:
     train_grp.add_argument("--grad-accum", type=int, default=1,
                            help="Gradient accumulation steps (effective_bs = batch × accum).")
     train_grp.add_argument("--seq-len", type=int, default=32, help="Sequence length (Pulse-Stream: 32 for 100+ steps/s)")
-    train_grp.add_argument("--lr", type=float, default=2e-4,
-                           help="Base learning rate (Saturation v24).")
-    train_grp.add_argument("--min-lr-ratio", type=float, default=0.005,
+    p.add_argument("--lr", type=float, default=0.0098) # v22: Ultra-High LR for <0.2 Loss
+    train_grp.add_argument("--min-lr-ratio", type=float, default=0.05,
                            help="Minimum LR as a fraction of peak LR (cosine schedule).")
     train_grp.add_argument("--warmup-ratio", type=float, default=0.1,
                            help="Fraction of total steps used for linear LR warm-up.")
@@ -347,8 +346,6 @@ Examples:
     train_grp.add_argument("--seed", type=int, default=42)
     train_grp.add_argument("--early-stop-patience", type=int, default=3,
                            help="Stop if val loss doesn't improve for N epochs (0=disabled).")
-    train_grp.add_argument("--world-size", type=int, default=0,
-                           help="Number of parallel processes (0=auto-detect).")
 
     # Model architecture
     arch_grp = p.add_argument_group("Architecture")
@@ -475,8 +472,6 @@ def setup_msvc_env() -> None:
 
 def main() -> None:
     setup_msvc_env()
-    # Shift-Core v32: 2 threads per cluster
-    torch.set_num_threads(2)
     args = parse_args().parse_args()
     torch.manual_seed(args.seed)
 
@@ -487,11 +482,11 @@ def main() -> None:
         device = auto_device()
 
     if device.type == "cpu":
-        # Temporal Overdrive v32: Full-Core Saturation
+        # Heterogeneous Storm v18: Full 10-core Spawning Drive
         torch.set_flush_denormal(True)
-        # 10 workers * 1 thread = 10 physical cores. Perfect 1:1 mapping.
+        # Using 8 processes, each with 1 OMP thread = Full P-Core saturation
         torch.set_num_threads(1) 
-        logger.info(f"Auto-Optimization (CPU): Saturation v32 Active | 10 Workers Spawning (1 thread/ea)...")
+        logger.info(f"Auto-Optimization (CPU): Saturation v21 Active | 8 Workers Spawning...")
     elif device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         if torch.cuda.get_device_capability()[0] >= 8:
@@ -501,33 +496,17 @@ def main() -> None:
 
     # Batch size auto (V20 scale upgrade)
     if args.batch_size <= 0:
-        args.batch_size = 2 if device.type == "cpu" else 32
-    batch_size = args.batch_size
+        batch_size = 2 if device.type == "cpu" else 32
+    else:
+        batch_size = args.batch_size
     
-    # ── Multi-Lane Acceleration (Hogwild! v31) ───────────────────────────
-    # Detect optimal core saturation (P-Cores vs E-Cores)
-    # Mobile CPUs with 8+ cores often perform better with 4-6 workers (Reduced cache thrashing)
-    if args.world_size == 0:
-        if device.type == "cpu":
-            # Saturation v32: Full cluster for 100+ steps/sec global target
-            args.world_size = 10
-            logger.info("Auto-Optimization (CPU): Saturation v32 | Target: 100+ steps/s Cluster.")
-        else:
-            args.world_size = mp.cpu_count() or 1
-            
-    world_size = args.world_size
-
-    logger.info(f"Device: {device}  |  Batch size (V20): {args.batch_size}")
+    logger.info(f"Device: {device}  |  Batch size (V20): {batch_size}")
+    args.batch_size = batch_size # Sync back to args for distributed launch
 
     # ── CPU Hyper-Breakthrough (100+ steps/s) ──────────────────────────────
     if device.type == "cpu" and args.seq_len == 512:
         args.seq_len = 128
         logger.info("Auto-Optimization (CPU): Applied Turbo-Context Scaling (seq_len=128) to ensure 100+ steps/s.")
-    
-    # Pulse-Sync v29.1: Auto-Scale Gradient Accumulation for CPU Performance
-    if device.type == "cpu" and args.grad_accum == 1:
-        args.grad_accum = 16
-        logger.info("Auto-Optimization (CPU): Applied Grad-Accum (m_size=16) to ensure 100+ steps/s with Clipping.")
 
     # ── Data pipeline ──────────────────────────────────────────────────────
     local_sources: list[Path] = []
@@ -591,29 +570,12 @@ def main() -> None:
         _rnd.seed(args.seed)
         vocab_texts = _rnd.sample(vocab_texts, 20_000)
 
-    logger.info("Building vocabulary (Point 1 & 3) …")
-    # Point 1: 8k-16k vocab target (12,000 default)
-    # Point 3: rare tokens removed (min_freq=2) + lowercase forced
-    tokenizer = WordTokenizer.from_texts(vocab_texts, max_vocab=12000, min_freq=2)
+    logger.info("Building vocabulary …")
+    tokenizer = WordTokenizer.from_texts(vocab_texts)
     logger.info(f"Vocabulary size: {tokenizer.vocab_size:,}")
 
     # ── Tensor datasets ─────────────────────────────────────────────────────
     logger.info("Tokenizing training pairs …")
-    # Point 9: Prepare contiguous datasets in RAM. 
-    train_inputs, train_labels, skipped_train = build_sft_tensors(train_pairs, tokenizer, args.seq_len)
-    train_inputs = train_inputs.contiguous()
-    train_labels = train_labels.contiguous()
-    
-    v_inputs, v_labels, skipped_val = build_sft_tensors(val_pairs, tokenizer, args.seq_len)
-    v_inputs = v_inputs.contiguous()
-    v_labels = v_labels.contiguous()
-    
-    # --- Point 2: Torch.Compile Optimization ---
-    # mode="reduce-overhead" is ideal for CPU training loops
-    # NOTE: On Windows (spawn), we compile inside the worker to avoid pickling errors.
-    if args.compile and device.type != "cpu":
-        logger.info("Auto-Optimization (GPU): Compiling model (reduce-overhead) …")
-        model = torch.compile(model, mode="reduce-overhead")
     
     # Turbo Engine v4: Force RAM Mode for CPU to eliminate SSD latency
     use_ssd = False if device.type == "cpu" else (args.use_ssd or (len(train_pairs) > 50000))
@@ -635,7 +597,10 @@ def main() -> None:
         train_inputs = Dummy()
         train_inputs.__len__ = lambda: len(train_pairs)
     else:
-        logger.info(f"Training tokens: {len(train_inputs):,} examples | Mode: RAM-Master")
+        train_inputs, train_labels, skipped_train = build_sft_tensors(
+            train_pairs, tokenizer, seq_len=args.seq_len
+        )
+        logger.info(f"Training tokens: {len(train_inputs):,} examples ({skipped_train} skipped) | Mode: RAM-Master")
         train_loader = DataLoader(
             TensorDataset(train_inputs, train_labels),
             batch_size=batch_size,
@@ -650,7 +615,8 @@ def main() -> None:
     has_val = len(val_pairs) > 0
     val_loader: DataLoader | None = None
     if has_val:
-        logger.info(f"Validation tensors: {len(v_inputs):,} examples")
+        v_inputs, v_labels, skipped_val = build_sft_tensors(val_pairs, tokenizer, seq_len=args.seq_len)
+        logger.info(f"Validation tensors: {len(v_inputs):,} examples ({skipped_val} skipped)")
         if len(v_inputs) > 0:
             val_loader = DataLoader(
                 TensorDataset(v_inputs, v_labels),
@@ -732,15 +698,10 @@ def main() -> None:
     # Estimate size: Params * 4 bytes (FP32) / 1024^2 = MB
     est_size_mb = (n_params * 4) / (1024 ** 2)
     
-    total_expected_steps = len(train_inputs) // args.batch_size # Global potential
-    # Corrected alignment: Use the actual world_size (number of workers) for steps_per_epoch calculation
-    steps_per_epoch = len(train_inputs) // (args.batch_size * world_size) if world_size > 0 else len(train_inputs) // args.batch_size
+    total_expected_steps = len(train_pairs) // (args.batch_size) # Global potential
+    steps_per_epoch = len(train_pairs) // (args.batch_size * (8 if device.type == 'cpu' else 1))
     if args.max_steps_per_epoch > 0:
         steps_per_epoch = min(steps_per_epoch, args.max_steps_per_epoch)
-    
-    # Pulse-Sync v26: Zero-Step Guard
-    if steps_per_epoch <= 0 and len(train_pairs) > 0:
-        steps_per_epoch = 1
     
     print(f"{_get_stamp()}  Training Plan: {args.epochs} Epochs | {steps_per_epoch} Steps/Epoch")
     print(f"{_get_stamp()}  Model Intelligence: {n_params:,} Parameters | ~{est_size_mb:.2f} MB on disk")
@@ -763,8 +724,7 @@ def main() -> None:
     # --- NeuroSwift Turbo-Engine 2.0: Asynchronous Hogwild Launch ---
     # --- NeuroSwift Saturation 2.1: Optimized Rank Affinity ---
     # world_size = 8: Focuses on 100% P-Core saturation, avoiding E-Core slowdowns.
-    # Pulse-Sync v31: Uses dynamic world_size from main logic
-    world_size = world_size
+    world_size = 8 if device.type == "cpu" else 1
     if device.type == "cpu":
         # ── Zero-Copy Shared Memory (Mandatory for Windows/mp.spawn) ────────────
         train_inputs.share_memory_()
@@ -796,44 +756,19 @@ def main() -> None:
 
 def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, v_labels, tokenizer, args, shared_steps, shared_losses, barrier):
     # Worker Startup (Hogwild! Asynchronous Mode) ─────────────────────────────
-    # --- Point 3: Dynamic Thread Allocation ---
-    cores = mp.cpu_count()
-    threads_per_worker = max(1, cores // world_size)
-    torch.set_num_threads(threads_per_worker) 
-    device = torch.device(args.device if args.device else "cpu")
+    device = torch.device("cpu")
+    torch.set_num_threads(1) 
     torch.set_num_interop_threads(1)
     
-    # Point 5 & 6: Pre-allocate Batch Buffers EARLY for compilation warm-up
-    batch_inp = torch.zeros((args.batch_size, args.seq_len), dtype=torch.long, device=device)
-    batch_lbl = torch.zeros((args.batch_size, args.seq_len), dtype=torch.long, device=device)
-    
-    # Point 2: Sequential Compile for Windows (CPU/Spawn) stability
-    if args.compile and device.type == "cpu":
-        try:
-            for r in range(world_size):
-                if rank == r:
-                    if os.name == "nt":
-                        setup_msvc_env()
-                    model = torch.compile(model, mode="reduce-overhead")
-                    # Warm-up pass to trigger MSVC
-                    model(batch_inp)
-                barrier.wait() 
-        except Exception as e:
-            if rank == 0:
-                print(f"[NeuroSwift AutoTrain] Warning: torch.compile failed: {e}. Falling back to eager mode.")
-            barrier.wait()
-
     # Ghost-Sync Weight Sharing: Already connected to Master memory
-    model.train()
-    
-    # Point 10: Grad Accumulation (m_size)
-    m_size = args.grad_accum
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
     
     # Turbo-Engine Configuration
     # Heartbeat suppressed per User Request (v20.1)
     
-    # Pulse-Sync v21: Buffer multi batches before shared-memory update
+    # Pulse-Sync v21: Buffer 16 batches before shared-memory update
+    # Balanced Performance: Restores high-fidelity convergence (Stability v21).
+    m_size = 16
     
     # High-Performance Data Engine: Raw Slicing (Bypasses Python DataLoader overhead)
     segment_size = len(train_inputs) // world_size
@@ -856,92 +791,49 @@ def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, 
         barrier.wait()
         
         model.train()
-        # Pulse-Sync v29.1: Diverse Worker Randomization
-        # Each worker gets a unique seed per epoch to maximize data coverage across the cluster
-        worker_seed = args.seed + epoch + rank
-        torch.manual_seed(worker_seed)
-        import random as _rnd
-        _rnd.seed(worker_seed)
-
         # Initial calibration
         prev_cluster_steps = 0
         step_start_time = time.time()
-        actual_speed = 0.0   # Pulse-Sync v27: Global Stability Fix
-        samples_sec = 0.0    # Pulse-Sync v27: Global Stability Fix
         
         # v22: Randomized Telemetry Interval (50-100 steps)
         import random as _rnd
         next_log_step = _rnd.randint(50, 100)
         
-        # Pulse-Sync v29: Data Diversity & Subset Sampling (20K-40K window)
-        subset_size = min(40000 // world_size, total_local)
-        local_indices = torch.randperm(total_local)[:subset_size]
-        local_steps = subset_size // args.batch_size
+        # Local Shuffle for each epoch
+        local_indices = torch.randperm(total_local)
         
-        # Pulse-Sync v29: Cosine Scheduler with 5% Warmup phase
-        total_training_steps = args.epochs * local_steps
-        warmup_steps = int(0.05 * total_training_steps)
-        
-        for i in range(0, subset_size - args.batch_size, args.batch_size):
-            current_local_step = i // args.batch_size
-            global_step = (epoch - 1) * local_steps + current_local_step
-            
-            # --- Pulse-Sync v29: Cosine Decay with Warmup Logic ---
-            if global_step < warmup_steps:
-                # Linear Warmup
-                lr_scale = float(global_step) / float(max(1, warmup_steps))
-            else:
-                # Cosine Decay
-                progress = float(global_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
-                lr_scale = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-            
-            # Adaptive LR Chill: Prevent late-stage oscillation if loss is already low
-            if shared_losses[rank] < 0.05:
-                lr_scale *= 0.7
-                
-            current_lr = args.lr * lr_scale
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
-
-            # --- Pulse-Sync v30: Loop Break Safety ---
-            # Correctly handle step-based early finish per User Request
-            if args.max_steps_per_epoch > 0 and (i // args.batch_size) >= args.max_steps_per_epoch:
+        for i in range(0, total_local - args.batch_size, args.batch_size):
+            if hasattr(args, "max_steps_per_epoch") and args.max_steps_per_epoch > 0 and (i // args.batch_size) >= args.max_steps_per_epoch:
                 break
-
+            
             # Zero-Overhead Slicing: Directly indexing into RAM tensors
             batch_slice = local_indices[i : i + args.batch_size]
-            # Point 5 & 6: Use copy_() into preallocated buffer to avoid allocation
-            batch_inp.copy_(train_inputs[start_idx + batch_slice])
-            batch_lbl.copy_(train_labels[start_idx + batch_slice])
+            batch_inp = train_inputs[start_idx + batch_slice].to(device)
+            batch_lbl = train_labels[start_idx + batch_slice].to(device)
             
-            # Point 1 & 8: Ultra-lean forward step
             out = model(batch_inp, targets=batch_lbl)
             loss = out["loss"] / m_size
             loss.backward()
             
-            if ((current_local_step) + 1) % m_size == 0:
-                # Pulse-Sync v29: Gradient Clipping (max_norm=1.0) for stability
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if ((i // args.batch_size) + 1) % m_size == 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
             # --- Pulse-Sync v20 Telemetry: Real-Time Smooth Reporting ---
             # Update shared counter every batch for fluid speed calc (Eliminates 'fake' 0.0 reporting)
             shared_steps[rank] += 1
             shared_losses[rank] = 0.9 * shared_losses[rank] + 0.1 * (loss.item() * m_size)
             
-            is_last_step = (i + args.batch_size * 2) >= subset_size or (current_local_step + 1) >= local_steps
+            current_local_step = i // args.batch_size
+            is_last_step = (i + args.batch_size) >= (total_local - args.batch_size) or (current_local_step + 1) >= total_steps_in_epoch
             
             if rank == 0 and (current_local_step >= next_log_step or is_last_step):
                 current_time = time.time()
                 elapsed = current_time - step_start_time
                 
-                # Global Progress: Efficient Sum
-                curr_total_steps = shared_steps[0] # Using Rank 0 as proxy for Speed (Pulse-Sync v31)
-                for r in range(1, world_size):
-                     curr_total_steps += shared_steps[r]
+                # Global Progress: Sum of all lanes
+                curr_total_steps = sum(shared_steps)
                 
-                # Speed: Aggregate Micro-batches per second
+                # Speed: Steps / Sec (Now strictly accurate and smooth)
                 global_delta = curr_total_steps - prev_cluster_steps
                 actual_speed = global_delta / max(elapsed, 0.001)
                 
@@ -949,13 +841,12 @@ def train_worker(rank, world_size, model, train_inputs, train_labels, v_inputs, 
                 # [NeuroSwift AutoTrain] HH:MM:SS | Epoch <no> | Rank <no> | <steps> / <total> | Speed | LR | Loss
                 completed = min(curr_total_steps // world_size, total_steps_in_epoch)
                 percent = (completed / total_steps_in_epoch) * 100
-                # Samples/s strictly relative to global iterations (actual_speed)
-                samples_sec = actual_speed * args.batch_size
+                samples_sec = actual_speed * world_size * args.batch_size
                 
                 log_line = (f"{_get_stamp()}  Epoch {epoch} | Rank {rank} | "
                             f"{completed} / {total_steps_in_epoch} ({percent:.1f}%) | "
-                            f"Speed {actual_speed:.1f} global-steps /sec | "
-                            f"LR: {current_lr:.6f} | Samples/s: {samples_sec:.1f} | "
+                            f"Speed {actual_speed:.1f} steps /sec | "
+                            f"LR: {args.lr} | Samples/s: {samples_sec:.1f} | "
                             f"Loss: {shared_losses[rank]:.4f}")
                             
                 print(log_line, flush=True)

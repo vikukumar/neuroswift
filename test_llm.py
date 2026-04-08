@@ -124,11 +124,11 @@ Examples:
 
     # Generation params
     gen_grp = p.add_argument_group("Generation")
-    gen_grp.add_argument("--max_new_tokens", type=int, default=64)
-    gen_grp.add_argument("--temperature", type=float, default=0.7)
-    gen_grp.add_argument("--top-k", type=int, default=40)
-    gen_grp.add_argument("--top-p", type=float, default=0.9)
-    gen_grp.add_argument("--repetition-penalty", type=float, default=1.05)
+    gen_grp.add_argument("--max-new-tokens", type=int, default=None)
+    gen_grp.add_argument("--temperature", type=float, default=None)
+    gen_grp.add_argument("--top-k", type=int, default=None)
+    gen_grp.add_argument("--top-p", type=float, default=None)
+    gen_grp.add_argument("--repetition-penalty", type=float, default=None)
     gen_grp.add_argument("--modality", type=str, default=None,
                          choices=["image", "audio", "video", "all"],
                          help="Generate multimodal artifact (Omni model only).")
@@ -397,15 +397,16 @@ def main() -> None:
     args = parse_args().parse_args()
 
     device = torch.device(args.device) if args.device else auto_device()
-    # Header suppressed per User Request v33.8
-    # _print_header(args.model_dir, args)
+    _print_header(args.model_dir, args)
 
     # Load model
-    # Model loading quieted
+    logger.info(f"Loading model from {args.model_dir} …")
     try:
         model, tokenizer, model_type = load_model_and_tokenizer(args.model_dir, device, ternary_mode=args.ternary)
     except FileNotFoundError as exc:
+        logger.error(str(exc))
         sys.exit(1)
+    logger.info(f"Model type: {model_type}  |  Vocab: {tokenizer.vocab_size:,}")
 
     # Load generation config
     gen_cfg_path = args.model_dir / "generation_config.json"
@@ -416,8 +417,19 @@ def main() -> None:
     top_p = args.top_p if args.top_p is not None else float(gen_cfg.get("top_p", 0.9))
     rep_penalty = args.repetition_penalty if args.repetition_penalty is not None else float(gen_cfg.get("repetition_penalty", 1.1))
 
-    # RAG/Assistant disabled per User Request v33.8
-    assistant = None
+    # Load the NeuroSwiftAssistant for RAG
+    from neuroswift.omni import NeuroSwiftAssistant
+    try:
+        assistant = NeuroSwiftAssistant.from_pretrained(args.model_dir, device=device)
+    except Exception:
+        assistant = None
+
+    # Index data for RAG context
+    data_source = args.data_dir or args.data_path
+    if data_source and assistant is not None:
+        logger.info(f"Indexing {data_source} for RAG context …")
+        n = index_data_for_rag(assistant, data_source)
+        logger.info(f"Indexed {n} samples into RAG.")
 
     # ── Benchmarking ───────────────────────────────────────────────────────
     if args.benchmark:
@@ -427,6 +439,21 @@ def main() -> None:
         bench.run_all()
         return
 
+    # Also index README + docs
+    if assistant is not None:
+        for extra in [Path("README.md"), Path("docs")]:
+            if extra.exists():
+                try:
+                    if extra.is_dir():
+                        assistant.index_folder(extra)
+                    else:
+                        assistant.rag.add_document(
+                            text=extra.read_text(encoding="utf-8", errors="ignore"),
+                            source=str(extra),
+                            modality="text",
+                        )
+                except Exception:
+                    pass
 
     # ── Batch evaluation mode ──────────────────────────────────────────────
     if args.eval_file is not None:
@@ -468,42 +495,85 @@ def main() -> None:
     # ── Default prompt or interactive mode ────────────────────────────────
     prompt = args.prompt or ("what is neuroswift?" if not args.interactive else None)
     
+    # God-level temporal context
+    time_context = FuturePredictor.get_context()
+
     def _answer_one(user_prompt: str) -> None:
-        prompt_text = f"user: {user_prompt}\nassistant:"
-        prompt_ids = torch.tensor([tokenizer.encode(prompt_text)], dtype=torch.long, device=device)
+        # Inject time context into assistant if available
+        final_prompt = f"{time_context}\n\nQuestion: {user_prompt}"
         
-        with torch.no_grad():
-            gen_ids = model.generate(
-                prompt_ids,
+        if assistant is not None:
+            # Use web search if requested
+            if args.web_search:
+                logger.info("Web-Search RAG enabled.")
+                web_hits = assistant.rag.web_query(user_prompt)
+                if web_hits:
+                    # Injected manually into prompt for now
+                    web_text = assistant.rag.format_hits(web_hits)
+                    final_prompt = f"Web Search Context:\n{web_text}\n\n{final_prompt}"
+
+            result = assistant.answer(
+                final_prompt,
+                retrieve_k=args.retrieve_k,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
-                eos_token_id=tokenizer.eos_token_id,
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=rep_penalty,
             )
-        
-        answer_ids = gen_ids[0, prompt_ids.size(1):].tolist()
-        answer = tokenizer.decode(answer_ids).strip()
-        
-        # Clean Output Architecture
-        sys.stdout.write(f"\nAssistant: {answer}\n\n")
-        sys.stdout.flush()
+            answer = result["answer"]
+            answer_source = result["answer_source"]
+            retrieval_hits = len(result.get("retrieval_hits", []))
+            compiled_prompt = result.get("compiled_prompt", user_prompt)
+        else:
+            # Bare model without NeuroSwiftAssistant
+            prompt_text = f"user: {user_prompt}\nassistant:"
+            prompt_ids = torch.tensor([tokenizer.encode(prompt_text)], dtype=torch.long, device=device)
+            with torch.no_grad():
+                gen_ids = model.generate(
+                    prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    eos_token_id=tokenizer.eos_token_id,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=rep_penalty,
+                    adapt_during_generation=False,
+                )
+            answer_ids = gen_ids[0, prompt_ids.size(1):].tolist()
+            answer = tokenizer.decode(answer_ids).strip()
+            answer_source = "model_generation"
+            retrieval_hits = 0
+            compiled_prompt = prompt_text
+
+        print(f"\n  Answer [{answer_source}]:")
+        print(f"  {_safe(answer)}")
+        print(f"  (RAG hits: {retrieval_hits})")
+
+        # Plasticity analysis
+        if args.show_plasticity and model_type == "lm":
+            p_ids = torch.tensor([tokenizer.encode(compiled_prompt)], dtype=torch.long, device=device)
+            p_stats = analyze_plasticity(model, p_ids, model_type)
+            print(f"  Plasticity shift: {p_stats['logit_shift']:.6f}  |  State norm: {p_stats['state_norm']:.6f}")
+        print()
 
     if args.interactive:
-        print("\nNeuroSwift Interactive (Simple Mode)\n")
+        print("\nNeuroSwift Chat — type 'quit' to exit\n")
         while True:
             try:
                 user_input = input("You: ").strip()
             except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye!")
                 break
-            if not user_input or user_input.lower() in {"quit", "exit", "q"}:
+            if not user_input or user_input.lower() in {"quit", "exit", "bye", "q"}:
+                print("Goodbye!")
                 break
             _answer_one(user_input)
     elif prompt:
+        print(f"\n  Prompt: {prompt!r}")
         _answer_one(prompt)
     else:
-        pass
+        print("No prompt provided. Use --prompt 'your question' or --interactive.")
 
 
 if __name__ == "__main__":

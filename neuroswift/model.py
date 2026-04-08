@@ -44,7 +44,6 @@ class NeuroSwiftConfig:
     expert_hidden: int = 256
     plastic_dim: int = 48
     dropout: float = 0.1
-    emb_dropout: float = 0.05
     aux_loss_scale: float = 1e-2
     attn_interval: int = 0  # Reverted default to protection legacy models
     ternary_mode: bool = False  # Enable BitNet-style MatMul-free execution
@@ -52,7 +51,7 @@ class NeuroSwiftConfig:
     
     # NeuroSwift v1 Features
     version: str = "v1"
-    label_smoothing: float = 0.05  # Enabled by default in v29
+    label_smoothing: float = 0.0
     adaptive_dropout: bool = False
     stability_module: bool = False
     dynamic_top_k: bool = True
@@ -180,7 +179,6 @@ class NeuroSwiftLM(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.emb_norm = RMSNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-        self.emb_dropout = nn.Dropout(config.emb_dropout)
         self.blocks = nn.ModuleList([NeuroSwiftBlock(config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -218,7 +216,7 @@ class NeuroSwiftLM(nn.Module):
 
         x = self.token_embedding(input_ids)
         x = self.emb_norm(x)
-        x = self.emb_dropout(x)
+        x = self.dropout(x)
 
         if ssm_states is None:
             ssm_states = [None] * len(self.blocks)
@@ -275,14 +273,26 @@ class NeuroSwiftLM(nn.Module):
         }
 
         if targets is not None:
-            # v29: Add Label Smoothing to prevent memorization collapse
-            logits_flat = logits.reshape(-1, logits.size(-1))
-            targets_flat = targets.reshape(-1)
-            ls = getattr(self.config, "label_smoothing", 0.05)
-            loss = F.cross_entropy(logits_flat, targets_flat, label_smoothing=ls)
+            # Standard next-token CE loss
+            ce_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                label_smoothing=self.config.label_smoothing
+            )
             
-            # v29: Combined Loss with MoE aux (MTP disabled for CPU speed)
-            out["loss"] = loss + (self.config.aux_loss_scale * aux_loss)
+            # Multi-Token Prediction (MTP) Loss - Disabled for 30 steps/sec Hyperdrive
+            mtp_loss = 0.0
+            # mtp_logits = self.mtp_head(x).float()
+            # out["mtp_logits"] = mtp_logits
+            # if targets.size(1) > 1:
+            #     mtp_targets = targets[:, 1:]
+            #     mtp_loss = F.cross_entropy(
+            #         mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)),
+            #         mtp_targets.reshape(-1)
+            #     )
+            
+            # Combined Loss: Standard + 0.1*MTP + Aux (Titan v10 Stability)
+            out["loss"] = ce_loss + 0.1 * mtp_loss + self.config.aux_loss_scale * aux_loss
 
         return out
 
@@ -309,51 +319,51 @@ class NeuroSwiftLM(nn.Module):
         top_k: int,
         top_p: float,
     ) -> Tensor:
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
 
-        # Point 2: Improve Decoding (standard patterns)
-        # 1. Temperature scaling
-        logits = logits / max(temperature, 1e-5)
+        filtered = logits / max(temperature, 1e-5)
 
-        # 2. Top-K filtering
-        if top_k > 0:
-            top_k_values, top_k_indices = torch.topk(logits, k=min(top_k, logits.size(-1)))
-            # Mask out non-Top-K tokens
-            logits = torch.where(
-                logits < top_k_values[..., -1].unsqueeze(-1),
-                torch.full_like(logits, float("-inf")),
-                logits
-            )
+        if top_k > 0 and top_k < filtered.size(-1):
+            top_values, _ = torch.topk(filtered, top_k, dim=-1)
+            kth = top_values[:, -1].unsqueeze(-1)
+            filtered = torch.where(filtered < kth, torch.full_like(filtered, float("-inf")), filtered)
 
-        # 3. Top-P (Nucleus) filtering
         if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift to keep the first token that exceeds top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            # Fill masked sorted_logits with -inf
-            sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
-            # Scatter back to original order
-            logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_indices, sorted_logits)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove_mask = cumulative > top_p
+            remove_mask[:, 1:] = remove_mask[:, :-1].clone()
+            remove_mask[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+            filtered = torch.full_like(filtered, float("-inf"))
+            filtered.scatter_(1, sorted_indices, sorted_logits)
 
-        # 4. Final Multinomial Sampling
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        return next_token
+        # v23.2: Robust Sampling Guard
+        filtered = torch.nan_to_num(filtered, nan=-100.0, posinf=100.0, neginf=-100.0)
+        probs = torch.softmax(filtered, dim=-1)
+        
+        # Stability Fallback: If softmax produces NaNs or all-zeros, default to Greedy
+        if torch.any(torch.isnan(probs)) or torch.any(torch.isinf(probs)):
+            return torch.argmax(logits, dim=-1, keepdim=True)
+            
+        try:
+            return torch.multinomial(probs, num_samples=1)
+        except RuntimeError:
+            # Absolute Fallback: Greedy selection
+            return torch.argmax(logits, dim=-1, keepdim=True)
 
     @torch.no_grad()
     def generate(
         self,
         input_ids: Tensor,
-        max_new_tokens: int = 64,
-        temperature: float = 0.7,
+        max_new_tokens: int = 40,
+        temperature: float = 1.0,
         eos_token_id: Optional[int] = None,
-        top_k: int = 40,
-        top_p: float = 0.9,
-        repetition_penalty: float = 1.05,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         adapt_during_generation: bool = False,
         ssm_external_states: Optional[list[Optional[Tensor]]] = None,
     ) -> Tensor:

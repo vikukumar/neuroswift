@@ -29,18 +29,52 @@ def _check_cache_exists(repo_id: str, prefix: str = "") -> Optional[Path]:
     return None
 
 def _download_hf_single(repo_id: str) -> Path:
-    """Synchronous worker for HF snapshot_download."""
-    from huggingface_hub import snapshot_download
-    output_dir = Path("artifacts/datasets") / repo_id.replace("/", "_")
+    """Uses 'datasets' library to fetch data and export to JSONL for pipeline flow."""
+    import json
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        logger.error("Dataset library NOT found. Please install: pip install datasets")
+        raise
+
+    safe_name = repo_id.replace("/", "_")
+    output_dir = Path("artifacts/datasets") / safe_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / "dataset.jsonl"
     
-    snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        local_dir=output_dir,
-        local_dir_use_symlinks=False
-    )
-    return output_dir
+    # One-time download check
+    if jsonl_path.exists() and jsonl_path.stat().st_size > 0:
+        return output_dir
+
+    logger.info(f"Loading HF dataset '{repo_id}' via datasets library...")
+    try:
+        # load_dataset manages its own cache, but we export it to our local artifacts 
+        # to ensure the existing pipeline's directory-based ingestion works perfectly.
+        ds = load_dataset(repo_id)
+        
+        count = 0
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            if hasattr(ds, "keys"):
+                for split_name in ds.keys():
+                    for row in ds[split_name]:
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        count += 1
+            else:
+                for row in ds:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    count += 1
+        
+        logger.info(f"Successfully cached {count:,} samples from '{repo_id}' to {jsonl_path}")
+        return output_dir
+    except Exception as e:
+        logger.warning(f"Datasets library failed for {repo_id}: {e}. Falling back to snapshot_download.")
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=output_dir
+        )
+        return output_dir
 
 def _download_kaggle_single(dataset_id: str) -> Path:
     """Synchronous worker for Kaggle download."""

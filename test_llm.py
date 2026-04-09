@@ -176,7 +176,23 @@ def load_model_and_tokenizer(model_dir: Path, device: torch.device, ternary_mode
         config_meta = json.loads(config_path.read_text(encoding="utf-8"))
         
     is_omni = "text_vocab_size" in config_meta or "image_size" in config_meta
-    tokenizer = load_tokenizer(model_dir)
+    # v35: Standardized loading matching train_small_llm.py
+    from neuroswift.tokenizer import HybridTokenizer
+    tokenizer = HybridTokenizer.from_texts([], vocab_size=12000, output_dir=model_dir)
+
+    # Health Check 1: Vocab Size
+    if tokenizer.vocab_size < 100:
+        logger.warning(f"Tokenizer at {model_dir} appears corrupted (vocab={tokenizer.vocab_size}).")
+    
+    # Health Check 2: Decoding Sanity
+    test_str = "NeuroSwift Tokenizer Check"
+    try:
+        encoded = tokenizer.encode(test_str)
+        decoded = tokenizer.decode(encoded)
+        if not decoded or len(decoded) < 5:
+            logger.error("Tokenizer decoding sanity check failed!")
+    except Exception as e:
+        logger.error(f"Tokenizer health check crashed: {e}")
 
     if is_omni:
         from neuroswift.omni import NeuroSwiftOmni
@@ -186,22 +202,6 @@ def load_model_and_tokenizer(model_dir: Path, device: torch.device, ternary_mode
         from neuroswift.model import NeuroSwiftLM
         model = NeuroSwiftLM.from_pretrained(model_dir, device=device)
         mode = "lm"
-        
-    # Vocab Rescue: Try model.pt first, then tokenizer_vocab.json
-    vocab_found = False
-    if model_pt.exists():
-        try:
-            ckpt = torch.load(model_pt, map_location="cpu")
-            if "vocab" in ckpt and ckpt["vocab"] and hasattr(tokenizer, "load_vocab"):
-                tokenizer.load_vocab(ckpt["vocab"])
-                vocab_found = True
-        except Exception:
-            pass
-            
-    vocab_json = model_dir / "tokenizer_vocab.json"
-    if not vocab_found and vocab_json.exists() and hasattr(tokenizer, "load_vocab"):
-        tokenizer.load_vocab(json.loads(vocab_json.read_text()))
-        logger.info("Rescued vocab from tokenizer_vocab.json.")
 
     if mode == "lm" and ternary_mode:
         model.config.ternary_mode = True
@@ -324,7 +324,7 @@ def batch_evaluate(
     valid_ppl_cnt = 0
 
     for pair in pairs:
-        prompt_text = f"user: {pair.prompt}\nassistant:"
+        prompt_text = f"instruction: {pair.instruction}\nresponse:"
         prompt_ids = torch.tensor([tokenizer.encode(prompt_text)], dtype=torch.long, device=device)
 
         with torch.no_grad():
@@ -358,7 +358,7 @@ def batch_evaluate(
         
         # Perplexity calculation (Cross-Entropy on reference response)
         try:
-            full_text = f"{prompt_text} {pair.response}"
+            full_text = f"instruction: {pair.instruction}\nresponse: {pair.response}"
             full_ids = torch.tensor([tokenizer.encode(full_text)], dtype=torch.long, device=device)
             with torch.no_grad():
                 out = model(full_ids)
@@ -499,8 +499,8 @@ def main() -> None:
     time_context = FuturePredictor.get_context()
 
     def _answer_one(user_prompt: str) -> None:
-        # Inject time context into assistant if available
-        final_prompt = f"{time_context}\n\nQuestion: {user_prompt}"
+        # Inject context if available
+        final_prompt = user_prompt
         
         if assistant is not None:
             # Use web search if requested
@@ -527,7 +527,7 @@ def main() -> None:
             compiled_prompt = result.get("compiled_prompt", user_prompt)
         else:
             # Bare model without NeuroSwiftAssistant
-            prompt_text = f"user: {user_prompt}\nassistant:"
+            prompt_text = f"instruction: {user_prompt}\nresponse:"
             prompt_ids = torch.tensor([tokenizer.encode(prompt_text)], dtype=torch.long, device=device)
             with torch.no_grad():
                 gen_ids = model.generate(

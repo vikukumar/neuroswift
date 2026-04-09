@@ -209,7 +209,9 @@ class DatasetFolderReader:
                                 metadata={"content_type": content_type, "status_code": response.status_code})
 
     def _read_text_file(self, path: Path, modality: str = "text") -> MultimodalSample:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        from .data_pipeline import smart_decode
+        raw = path.read_bytes()
+        text = smart_decode(raw)
         return MultimodalSample(modality=modality, source=str(path), text=text)
 
     def _read_pdf_file(self, path: Path) -> MultimodalSample:
@@ -222,16 +224,23 @@ class DatasetFolderReader:
         return MultimodalSample(modality="pdf", source=str(path), text=text.strip())
 
     def _read_json_file(self, path: Path) -> MultimodalSample:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        from .data_pipeline import smart_decode
+        raw = path.read_bytes()
+        text = smart_decode(raw)
         return MultimodalSample(modality="json", source=str(path), text=text)
 
     def _read_yaml_file(self, path: Path) -> MultimodalSample:
         if yaml is None: return MultimodalSample(modality="yaml", source=str(path), text="")
-        payload = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore"))
+        from .data_pipeline import smart_decode
+        raw = path.read_bytes()
+        text = smart_decode(raw)
+        payload = yaml.safe_load(text)
         return MultimodalSample(modality="yaml", source=str(path), text=str(payload))
 
     def _read_csv_file(self, path: Path) -> MultimodalSample:
-        rows = path.read_text(encoding="utf-8", errors="ignore")
+        from .data_pipeline import smart_decode
+        raw = path.read_bytes()
+        rows = smart_decode(raw)
         return MultimodalSample(modality="table", source=str(path), text=rows)
 
     def _read_excel_file(self, path: Path) -> MultimodalSample:

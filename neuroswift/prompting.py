@@ -149,7 +149,7 @@ class PromptEngineer:
             if extra_text:
                 blocks.append(f"guidance:\n{extra_text}")
 
-        blocks.append(f"user: {prompt.strip()}\nassistant:")
+        blocks.append(f"instruction: {prompt.strip()}\nresponse:")
         return "\n\n".join(blocks)
 
 

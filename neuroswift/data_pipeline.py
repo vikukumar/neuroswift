@@ -46,6 +46,81 @@ import multiprocessing
 logger = logging.getLogger(__name__)
  
 # ---------------------------------------------------------------------------
+# Robust Encoding & Quality Utilities
+# ---------------------------------------------------------------------------
+
+def smart_decode(content: bytes) -> str:
+    """
+    Robustly decode bytes by trying multiple encodings.
+    Prevents the Γûü replacement character artifact by prioritizing logical fallbacks.
+    """
+    if not content:
+        return ""
+    # 1. Try UTF-8-sig (handles BOM)
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    # 2. Try Latin-1 (Common in older files)
+    try:
+        return content.decode("latin-1")
+    except UnicodeDecodeError:
+        pass
+    # 3. Try cp1252 (Windows specific)
+    try:
+        return content.decode("cp1252")
+    except UnicodeDecodeError:
+        pass
+    # 4. Final fallback with replacements
+    return content.decode("utf-8", errors="replace")
+
+
+class QualityFilter:
+    """
+    Library-level junk detection to prevent tokenizer pollution and noisy training.
+    Identifies logs, numeric-heavy text, and URL-heavy content.
+    """
+    _LOG_PATTERNS = [
+        re.compile(r"\d{4}-\d{2}-\d{2}"), # Date 2021-05-06
+        re.compile(r"\[(INFO|DEBUG|WARN|ERROR|FATAL|SUCCESS)\]"), # Log levels
+        re.compile(r"0x[0-9a-fA-F]+"), # Hex addresses
+        re.compile(r"\/[a-zA-Z0-9_\/]+\/[a-zA-Z0-9_\.\/]+"), # Linux file paths
+        re.compile(r"[a-zA-Z]:\\[a-zA-Z0-9_\\]+"), # Windows file paths
+        re.compile(r"\d+[\/\\]\d+"), # Numeric sequences like 1234/5678
+        re.compile(r"\d{3,}[\/\\]"), # Numeric pieces with slashes like 1234/
+    ]
+    _URL_HINTS = {"http://", "https://", "www.", ".com/", ".org/", ".net/", ".io/"}
+
+    @classmethod
+    def is_junk(cls, text: str, strict: bool = False) -> bool:
+        if not text: return True
+        text_len = len(text)
+        if text_len < 3: return True
+
+        # 1. Encoding Damage (Replacement Character \ufffd)
+        if text.count("\ufffd") > (text_len * 0.05): return True
+        
+        # 2. Numeric Density (Goal: Keep natural language)
+        digits = sum(1 for c in text if c.isdigit())
+        num_ratio = digits / text_len
+        if text_len > 20 and num_ratio > (0.3 if strict else 0.5): return True
+        
+        # 3. Log Detection (Multiple log tokens in short text)
+        log_matches = sum(1 for p in cls._LOG_PATTERNS if p.search(text))
+        if log_matches >= 2: return True
+        
+        # 4. URL/Web Junk
+        url_count = sum(1 for hint in cls._URL_HINTS if hint in text.lower())
+        if url_count >= (2 if strict else 4): return True
+        
+        # 5. Symbol Overload (Too much punctuation/unusual chars)
+        symbols = sum(1 for c in text if not c.isalnum() and not c.isspace())
+        sym_ratio = symbols / text_len
+        if text_len > 10 and sym_ratio > (0.25 if strict else 0.4): return True
+        
+        return False
+ 
+# ---------------------------------------------------------------------------
 # Mapping Constants (God-Level Schema detection)
 # ---------------------------------------------------------------------------
 _EXACT_MAPPINGS = [
@@ -74,16 +149,21 @@ _IGNORE_DOCS = {
 
 @dataclass
 class TrainPair:
-    """Unified instruction-response pair after full pipeline processing."""
+    """Unified instruction-context-response pair for NeuroSwift Training."""
 
-    prompt: str
-    response: str
+    instruction: str
+    context: str = ""
+    response: str = ""
     source: str = ""
     modality: str = "text"
     quality_score: float = 1.0  # 0.0–1.0
 
     def to_dict(self) -> dict[str, str]:
-        return {"prompt": self.prompt, "response": self.response}
+        return {
+            "instruction": self.instruction,
+            "context": self.context,
+            "response": self.response
+        }
 
 
 @dataclass
@@ -96,6 +176,7 @@ class PipelineStats:
     after_filter: int = 0
     after_dedup: int = 0
     skipped_empty: int = 0
+    skipped_corrupted: int = 0
     skipped_too_short: int = 0
     skipped_too_long: int = 0
     skipped_dedup: int = 0
@@ -111,6 +192,7 @@ class PipelineStats:
             f"  After filter:     {self.after_filter:>6,}",
             f"    (too short:     {self.skipped_too_short:>6,})",
             f"    (too long:      {self.skipped_too_long:>6,})",
+            f"    (corrupted:     {self.skipped_corrupted:>6,})",
             f"    (empty:         {self.skipped_empty:>6,})",
             f"  After dedup:      {self.after_dedup:>6,}",
             f"    (dupes removed: {self.skipped_dedup:>6,})",
@@ -127,72 +209,101 @@ class PipelineStats:
 
 class UniversalSchemaMapper:
     """
-    God-level schema mapper that automatically finds 'prompt' and 'response' 
-    like fields in any dictionary using fuzzy matching and heuristics.
+    Standardized schema mapper with automatic PII filtering.
+    Maps any dictionary to (instruction, context, response).
     """
     _PROMPT_HINTS = {"prompt", "instruction", "input", "question", "human", "user", "query", "q", "title", "header", "topic"}
     _RESP_HINTS = {"response", "output", "answer", "assistant", "gpt", "model", "a", "body", "content", "text", "summary", "description"}
+    
+    # v33.1: Sensitivity Filter (Substring Matching)
+    _PII_KEYS = {"password", "id", "username", "email", "api_key", "secret", "token", "ssn", "passport", "credit_card", "uuid", "guid"}
+
+    @classmethod
+    def _contains_pii(cls, obj: dict[str, Any]) -> bool:
+        keys = [k.lower() for k in obj.keys()]
+        for pii in cls._PII_KEYS:
+            if any(pii in k for k in keys):
+                return True
+        return False
+
+    @classmethod
+    def _is_uuid(cls, value: str) -> bool:
+        """Heuristic to detect UUID strings: 36 chars, 4 hyphens, hex-heavy."""
+        if not isinstance(value, str) or len(value) != 36:
+            return False
+        if value.count("-") != 4:
+            return False
+        # Check if it looks like hex
+        clean = value.replace("-", "")
+        return all(c in "0123456789abcdefABCDEF" for c in clean)
 
     @classmethod
     def map_obj(cls, obj: dict[str, Any], source: str = "") -> TrainPair | None:
         if not isinstance(obj, dict):
             return None
+            
+        # 0. Sensitivity Filter
+        if cls._contains_pii(obj):
+            logger.debug(f"Skipping sample from {source}: Contains PII keys.")
+            return None
 
         # 1. OpenAI Message Format Support
         if "messages" in obj and isinstance(obj["messages"], list):
-            # Take last user message as prompt, last assistant as response
-            p, r = "", ""
+            inst, ctx, resp = "", "", ""
             for m in obj["messages"]:
-                if m.get("role") == "user": p = m.get("content", "")
-                elif m.get("role") == "assistant": r = m.get("content", "")
-            if p and r: return TrainPair(prompt=p, response=r, source=source)
+                role = m.get("role")
+                content = m.get("content", "")
+                if role == "user": 
+                    inst = content
+                elif role == "system":
+                    ctx = content
+                elif role == "assistant": 
+                    resp = content
+            if inst and resp: 
+                return TrainPair(instruction=inst, context=ctx, response=resp, source=source)
 
         # 2. ShareGPT Support
         if "conversations" in obj and isinstance(obj["conversations"], list):
-            p, r = "", ""
+            inst, resp = "", ""
             for m in obj["conversations"]:
                 role = m.get("from")
-                if role in ("human", "user"): p = m.get("value", "")
-                elif role in ("gpt", "assistant"): r = m.get("value", "")
-            if p and r: return TrainPair(prompt=p, response=r, source=source)
+                if role in ("human", "user"): inst = m.get("value", "")
+                elif role in ("gpt", "assistant"): resp = m.get("value", "")
+            if inst and resp: 
+                return TrainPair(instruction=inst, response=resp, source=source)
         
         # 3. Exact match pass
         for pk, rk in _EXACT_MAPPINGS:
             p, r = str(obj.get(pk, "")).strip(), str(obj.get(rk, "")).strip()
             if p and r:
-                # v28: Check for context to prepend to prompt
-                context = str(obj.get("context", "")).strip()
-                if context: p = f"Context: {context}\n\nInstruction: {p}"
-                return TrainPair(prompt=p, response=r, source=source)
+                c = str(obj.get("context", "")).strip()
+                return TrainPair(instruction=p, context=c, response=r, source=source)
 
-        # 4. Fuzzy match pass (Auto-Intelligence V3)
+        # 4. Fuzzy match pass
         keys = list(obj.keys())
         p_key, r_key = None, None
         
-        # Heuristic: longest text is usually the response, second longest or 'question' like is prompt
-        sorted_by_len = sorted([k for k in keys if isinstance(obj[k], str)], key=lambda k: len(str(obj[k])), reverse=True)
+        sorted_by_len = sorted([k for k in keys if isinstance(obj[k], str) and not cls._is_uuid(str(obj[k]))], 
+                               key=lambda k: len(str(obj[k])), reverse=True)
         if not sorted_by_len: return None
 
-        # Look for indicators
         for k in sorted_by_len:
             lk = k.lower()
+            val = str(obj[k])
             if any(hint in lk for hint in cls._RESP_HINTS) and not r_key:
                 r_key = k
             elif any(hint in lk for hint in cls._PROMPT_HINTS) and not p_key:
                 p_key = k
 
-        # Fallback: take longest as response, second longest as prompt if no hints found
         if not r_key: r_key = sorted_by_len[0]
         if not p_key and len(sorted_by_len) > 1: p_key = sorted_by_len[1]
 
         if p_key and r_key and p_key != r_key:
             p, r = str(obj[p_key]).strip(), str(obj[r_key]).strip()
-            # Relaxed heuristic for short-form valid data
             if len(p) > 2 and len(r) > 1:
-                # v28: Check for context
-                context = str(obj.get("context", "")).strip()
-                if context and p_key != "context": p = f"Context: {context}\n\nInstruction: {p}"
-                return TrainPair(prompt=p, response=r, source=source)
+                c = str(obj.get("context", obj.get("input", ""))).strip()
+                if c == p or c == r: c = "" # Avoid duplicate context
+                return TrainPair(instruction=p, context=c, response=r, source=source)
         
         return None
 
@@ -229,13 +340,14 @@ def _read_jsonl(path: Path, cap_bytes: int = 500 * 1024 * 1024) -> Iterator[Trai
     """Stream pairs from a JSONL file, capped at cap_bytes to avoid OOM."""
     read_bytes = 0
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                read_bytes += len(line.encode())
+        # v29: Use binary read + smart_decode to prevent encoding artifacts (Γûü)
+        with path.open("rb") as fh:
+            for line_bytes in fh:
+                read_bytes += len(line_bytes)
                 if read_bytes > cap_bytes:
                     logger.debug(f"JSONL cap reached at {cap_bytes // 1024 // 1024} MB for {path}")
                     break
-                line = line.strip()
+                line = smart_decode(line_bytes).strip()
                 if not line:
                     continue
                 try:
@@ -252,9 +364,11 @@ def _read_jsonl(path: Path, cap_bytes: int = 500 * 1024 * 1024) -> Iterator[Trai
 def _read_json(path: Path) -> Iterator[TrainPair]:
     """Read a JSON file (list of objects or single object)."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if len(text) > 200 * 1024 * 1024:
-            text = text[:200 * 1024 * 1024]
+        # v29: Robust binary read + smart_decode
+        raw = path.read_bytes()
+        if len(raw) > 200 * 1024 * 1024:
+            raw = raw[:200 * 1024 * 1024]
+        text = smart_decode(raw)
         obj = json.loads(text)
         if isinstance(obj, list):
             for item in obj:
@@ -280,17 +394,20 @@ def _text_to_pairs(text: str, source: str, chunk_words: int = 150, stride_words:
         chunk = " ".join(words[start: start + chunk_words])
         if len(chunk) < 40:
             continue
-        # Make a simple comprehension prompt
-        prompt = f"Summarize the following text from {source_name}:\n{chunk[:400]}"
-        response = chunk[:800]
-        yield TrainPair(prompt=prompt, response=response, source=source)
+        # Standardized schema for raw text chunks
+        instruction = f"Summarize or explain the following text from {source_name}:"
+        context = chunk[:1000]
+        response = chunk[:1500]
+        yield TrainPair(instruction=instruction, context=context, response=response, source=source)
 
 
 def _read_text(path: Path, cap_bytes: int = 100 * 1024 * 1024) -> Iterator[TrainPair]:
     """Read plain text, markdown, RST files; chunk into pairs."""
     try:
-        raw = path.read_bytes()[:cap_bytes].decode("utf-8", errors="replace")
-        yield from _text_to_pairs(raw, source=str(path))
+        # v29: Robust binary read + smart_decode
+        raw = path.read_bytes()[:cap_bytes]
+        text = smart_decode(raw)
+        yield from _text_to_pairs(text, source=str(path))
     except Exception as exc:
         logger.warning(f"Error reading text {path}: {exc}")
 
@@ -298,31 +415,35 @@ def _read_text(path: Path, cap_bytes: int = 100 * 1024 * 1024) -> Iterator[Train
 def _read_csv(path: Path) -> Iterator[TrainPair]:
     """Read CSV/TSV and generate QA pairs from each non-header row."""
     import csv
+    import io
     try:
         sep = "\t" if path.suffix.lower() == ".tsv" else ","
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
-            reader = csv.DictReader(fh, delimiter=sep)
-            for row in reader:
-                vals = [str(v).strip() for v in row.values() if str(v).strip()]
-                keys = list(row.keys())
-                if not vals:
+        # v29: Binary read and wrap in StringIO for robust encoding repair
+        raw = path.read_bytes()
+        text = smart_decode(raw)
+        fh = io.StringIO(text)
+        reader = csv.DictReader(fh, delimiter=sep)
+        for row in reader:
+            vals = [str(v).strip() for v in row.values() if str(v).strip()]
+            keys = list(row.keys())
+            if not vals:
+                continue
+            # If first col looks like prompt and second like response
+            if len(keys) >= 2:
+                p = str(row.get(keys[0], "")).strip()
+                r = str(row.get(keys[1], "")).strip()
+                if p and r:
+                    yield TrainPair(instruction=p, response=r, source=str(path), modality="table")
                     continue
-                # If first col looks like prompt and second like response
-                if len(keys) >= 2:
-                    p = str(row.get(keys[0], "")).strip()
-                    r = str(row.get(keys[1], "")).strip()
-                    if p and r:
-                        yield TrainPair(prompt=p, response=r, source=str(path), modality="table")
-                        continue
-                # Otherwise: field: value summary
-                row_text = "; ".join(f"{k}: {v}" for k, v in row.items() if v.strip())
-                if row_text:
-                    yield TrainPair(
-                        prompt=f"Describe this record from {path.name}",
-                        response=row_text,
-                        source=str(path),
-                        modality="table",
-                    )
+            # Otherwise: field: value summary
+            row_text = "; ".join(f"{k}: {v}" for k, v in row.items() if v.strip())
+            if row_text:
+                yield TrainPair(
+                    instruction=f"Describe this record from {path.name}",
+                    response=row_text,
+                    source=str(path),
+                    modality="table",
+                )
     except Exception as exc:
         logger.warning(f"Error reading CSV {path}: {exc}")
 
@@ -345,14 +466,14 @@ def _read_xlsx(path: Path) -> Iterator[TrainPair]:
                     p = cells[0] if cells else ""
                     r = cells[1] if len(cells) > 1 else ""
                     if p and r:
-                        yield TrainPair(prompt=p, response=r, source=str(path), modality="table")
+                        yield TrainPair(instruction=p, response=r, source=str(path), modality="table")
                         continue
                 row_text = "; ".join(
                     f"{h}: {c}" for h, c in zip(headers, cells) if c
                 ) if headers else "; ".join(c for c in cells if c)
                 if row_text:
                     yield TrainPair(
-                        prompt=f"Describe this Excel record from {path.name}",
+                        instruction=f"Describe this Excel record from {path.name}",
                         response=row_text,
                         source=str(path),
                         modality="table",
@@ -379,14 +500,17 @@ def _read_multimodal(path: Path) -> Iterator[TrainPair]:
             if len(summary) < 20:
                 continue
             name = Path(sample.source).name if "://" not in sample.source else sample.source
+            tag = sample.modality.upper()
             yield TrainPair(
-                prompt=f"Describe the {sample.modality} content of {name}.",
+                instruction=f"Describe the content of this {sample.modality} file.",
+                context=f"<{tag}>{name}</{tag}>",
                 response=summary,
                 source=str(path),
                 modality=sample.modality,
             )
             yield TrainPair(
-                prompt=f"What is in the file {name}?",
+                instruction=f"What is in the file {name}?",
+                context=f"<{tag}>{name}</{tag}>",
                 response=f"The {sample.modality} file {name} contains: {summary}",
                 source=str(path),
                 modality=sample.modality,
@@ -500,19 +624,37 @@ _MULTI_NL = re.compile(r"\n{3,}")
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def sanitize_text(text: str) -> str:
+    """Strict UTF-8 sanitization. Non-destructive version."""
+    if not text:
+        return ""
+    # v30: encode-ignore-decode strategy as requested by USER
+    try:
+        return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    except:
+        return text
+
+
 def normalize_text(text: str) -> str:
-    """Unicode NFC, strip control chars, collapse whitespace."""
+    """Unicode NFC, strip control chars, collapse whitespace, and strict UTF-8 sanitize."""
+    if not text:
+        return ""
+    # Unicode repair
     text = unicodedata.normalize("NFC", text)
-    text = _CTRL.sub("", text)
+    # Collapse whitespace
     text = _MULTI_WS.sub(" ", text)
     text = _MULTI_NL.sub("\n\n", text)
-    text = text.strip()
-    return text
+    
+    # v30: Run UTF-8 sanitization AFTER normalization as requested
+    text = sanitize_text(text)
+    
+    return text.strip()
 
 
 def normalize_pair(pair: TrainPair) -> TrainPair:
     return TrainPair(
-        prompt=normalize_text(pair.prompt),
+        instruction=normalize_text(pair.instruction),
+        context=normalize_text(pair.context),
         response=normalize_text(pair.response),
         source=pair.source,
         modality=pair.modality,
@@ -544,39 +686,39 @@ def _is_repetitive(text: str, n: int = 4, threshold: float = 0.35) -> bool:
 
 def filter_pair(
     pair: TrainPair,
-    min_prompt_words: int = 2,
-    max_prompt_words: int = 2048, # Increased for V3 context
-    min_response_words: int = 3,
-    max_response_words: int = 4096, # Increased for V3 answers
+    min_prompt_words: int = 1, # Word counts deprecated for char counts per user rule
+    max_prompt_words: int = 2048,
+    min_response_words: int = 1,
+    max_response_words: int = 4096,
     stats: PipelineStats | None = None,
+    strict: bool = True,
 ) -> bool:
-    """Return True if the pair passes all quality filters."""
-    if not pair.prompt or not pair.response:
+    """Return True if the pair passes strict UTF-8 and safe length filters."""
+    if not pair.instruction or not pair.response:
         if stats:
             stats.skipped_empty += 1
         return False
 
-    pw = _word_count(pair.prompt)
-    rw = _word_count(pair.response)
+    # v30: MANDATORY: Remove corrupted tokens
+    full_text = pair.instruction + " " + pair.context + " " + pair.response
+    corrupted_markers = ["\ufffd", "Γ", "\x00"]
+    if any(m in full_text for m in corrupted_markers) or _CTRL.search(full_text):
+        if stats:
+            stats.skipped_corrupted += 1
+        return False
 
-    # Adaptive Scaling: If it's a table/math modality, allow shorter responses
-    effective_min_resp = 1 if pair.modality in ("table", "math", "qa") else min_response_words
-
-    if pw < min_prompt_words or rw < effective_min_resp:
+    # v30: MANDATORY: Safe Length Filter (RELAXED)
+    total_len = len(pair.instruction.strip()) + len(pair.context.strip()) + len(pair.response.strip())
+    if total_len < 20:
         if stats:
             stats.skipped_too_short += 1
         return False
-
-    if pw > max_prompt_words or rw > max_response_words:
+    if total_len > 3000: # Increased to accommodate context
         if stats:
             stats.skipped_too_long += 1
         return False
 
-    if _is_repetitive(pair.response):
-        if stats:
-            stats.skipped_too_short += 1
-        return False
-
+    # DO NOT apply any other content-based filtering as per USER instructions
     return True
 
 
@@ -614,7 +756,7 @@ def _hamming(a: int, b: int) -> int:
 
 def _get_marks(pair: TrainPair):
     """Worker to compute exact and near fingerprints."""
-    return _fingerprint(pair.prompt + " " + pair.response), _simhash(pair.response)
+    return _fingerprint(pair.instruction + " " + pair.context + " " + pair.response), _simhash(pair.response)
 
 
 def deduplicate(
